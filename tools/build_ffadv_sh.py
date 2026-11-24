@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-VERSION = "rapz-v13"
+VERSION = "rapz-v14"
 
 ROOT = Path(r"C:\Users\runneradmin\Downloads\projecr")
 REPO = ROOT / "ffadv-rapz"
@@ -29,7 +29,9 @@ script = f'''#!/system/bin/sh
 #  Tidak butuh Magisk / Zygisk. Cukup root + arm64-v8a.
 #
 #  sh /data/local/tmp/rap/ffadv.sh             -> inject
-#  sh /data/local/tmp/rap/ffadv.sh uninstall   -> hapus file
+#  sh /data/local/tmp/rap/ffadv.sh menu        -> menu interaktif
+#  sh /data/local/tmp/rap/ffadv.sh unattach    -> lepas ptrace + hapus payload
+#  sh /data/local/tmp/rap/ffadv.sh uninstall   -> hapus file + exit injector
 #  sh /data/local/tmp/rap/ffadv.sh --no-update -> inject tanpa cek update
 # ============================================================
 
@@ -72,16 +74,54 @@ fail() {{
 
 UPDATED=0
 if [ "$1" = "--updated" ]; then UPDATED=1; shift; fi
-if [ "$1" = "--no-update" ]; then shift; RAPZ_NO_UPDATE=1; fi
+if [ "$1" = "--no-update" ] || [ "$1" = "--force-inject" ]; then shift; RAPZ_NO_UPDATE=1; fi
 
 if [ "$(id -u)" -ne 0 ]; then
   fail "butuh root. jalankan lewat su."
 fi
 
-if [ "$1" = "uninstall" ] || [ "$1" = "remove" ]; then
+if [ "$1" = "uninstall" ] || [ "$1" = "remove" ] || [ "$1" = "exit" ]; then
   rm -f "$CANON" "$PAYLOAD" "$INJECTOR" "$LOG" "$NEW"
   say "file dihapus dari $DIR"
   exit 0
+fi
+
+if [ "$1" = "unattach" ]; then
+  mkdir -p "$DIR" 2>/dev/null
+  if [ -x "$INJECTOR" ]; then
+    "$INJECTOR" --unattach >> "$LOG" 2>&1
+    say "unattach: proses ptrace dilepas"
+  fi
+  rm -f "$PAYLOAD"
+  say "payload dihapus. game tetap jalan."
+  exit 0
+fi
+
+show_menu() {{
+  echo ""
+  echo "===== FULL RAPZ MENU ====="
+  echo " 1) Attach game + inject"
+  echo " 2) Unattach (lepas ptrace, hapus payload)"
+  echo " 3) Lihat log"
+  echo " 4) Uninstall / Exit injector"
+  echo " 5) Keluar menu"
+  echo "=========================="
+  printf "Pilih [1-5]: "
+}}
+
+if [ "$1" = "menu" ]; then
+  while true; do
+    show_menu
+    read -r _pil 2>/dev/null || _pil="5"
+    case "$_pil" in
+      1) sh "$CANON" --force-inject; say "kembali ke menu...";;
+      2) sh "$CANON" unattach; say "kembali ke menu...";;
+      3) cat "$LOG" 2>/dev/null || echo "(log kosong)";;
+      4) sh "$CANON" uninstall; exit 0;;
+      5) say "keluar menu"; exit 0;;
+      *) echo "pilihan tidak dikenal";;
+    esac
+  done
 fi
 
 # Selalu normalisasi ke /data/local/tmp/rap/ffadv.sh

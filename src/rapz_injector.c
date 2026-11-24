@@ -288,7 +288,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    logln("[RAPZ] build=rapz-v13 === start ===");
+    logln("[RAPZ] build=rapz-v14 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), so, pkg);
 
@@ -299,6 +299,17 @@ int main(int argc, char **argv) {
     }
     logln("[RAPZ] payload size=%lld mode=%o",
           (long long)st.st_size, (unsigned)st.st_mode & 0777);
+
+    if (argc > 1 && !strcmp(argv[1], "--unattach")) {
+        pid_t up = find_pid(pkg);
+        if (up > 0) {
+            ptrace(PTRACE_DETACH, up, 0, 0);
+            logln("[RAPZ] detach ptrace pid=%d (unattach)", up);
+        } else {
+            logln("[RAPZ] game tidak jalan, tidak ada yang di-detach");
+        }
+        return 0;
+    }
 
     pid_t pid = find_pid(pkg);
     if (pid < 0) {
@@ -317,27 +328,24 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    char libc_path[512] = {0};
-    uintptr_t libc_base = module_base(pid, "libc.so", libc_path, sizeof libc_path);
-    if (!libc_base) return 3;
-    if (!libc_path[0]) snprintf(libc_path, sizeof libc_path, "/system/lib64/libc.so");
-
-    char libdl_path[512] = {0};
-    uintptr_t libdl_base = module_base(pid, "libdl.so", libdl_path, sizeof libdl_path);
-    if (!libdl_base) {
-        logln("[RAPZ] libdl base tidak ada, attach dulu untuk cek map...");
-        if (ptrace(PTRACE_ATTACH, g_pid, 0, 0) < 0) {
-            logln("[RAPZ] attach gagal: %s", strerror(errno));
-            return 3;
-        }
-        { int st2; waitpid(g_pid, &st2, __WALL); }
-        libdl_base = module_base(pid, "libdl.so", libdl_path, sizeof libdl_path);
-        if (!libdl_base) {
-            ptrace(PTRACE_DETACH, g_pid, 0, 0);
-            return 3;
-        }
-        ptrace(PTRACE_DETACH, g_pid, 0, 0);
+    if (ptrace(PTRACE_ATTACH, g_pid, 0, 0) < 0) {
+        logln("[RAPZ] attach gagal: %s", strerror(errno));
+        return 5;
     }
+    { int st2; waitpid(g_pid, &st2, __WALL); }
+    logln("[RAPZ] attached");
+
+    // Baca semua base DARI SATU snapshot maps yang sama, setelah attach.
+    char libc_path[512] = {0}, libdl_path[512] = {0};
+    uintptr_t libc_base = module_base(pid, "libc.so", libc_path, sizeof libc_path);
+    uintptr_t libdl_base = module_base(pid, "libdl.so", libdl_path, sizeof libdl_path);
+    if (!libc_base || !libdl_base) {
+        logln("[RAPZ] base libc/libdl tidak lengkap libc=%llx libdl=%llx",
+              (unsigned long long)libc_base, (unsigned long long)libdl_base);
+        detach_run();
+        return 3;
+    }
+    if (!libc_path[0]) snprintf(libc_path, sizeof libc_path, "/system/lib64/libc.so");
     if (!libdl_path[0]) snprintf(libdl_path, sizeof libdl_path, "/system/lib64/libdl.so");
 
     uintptr_t off_mmap = symbol_offset(libc_path, "mmap");
@@ -346,21 +354,16 @@ int main(int argc, char **argv) {
         logln("[RAPZ] symbol resolve gagal mmap=%llx dlopen=%llx libc=%s libdl=%s",
               (unsigned long long)off_mmap, (unsigned long long)off_dlopen,
               libc_path, libdl_path);
+        detach_run();
         return 4;
     }
 
     uint64_t mmap_addr = libc_base + off_mmap;
     uint64_t dlopen_addr = libdl_base + off_dlopen;
-    logln("[RAPZ] mmap=%llx dlopen=%llx libdlbase=%llx",
+    logln("[RAPZ] mmap=%llx dlopen=%llx libcbase=%llx libdlbase=%llx off_mmap=%llx off_dlopen=%llx",
           (unsigned long long)mmap_addr, (unsigned long long)dlopen_addr,
-          (unsigned long long)libdl_base);
-
-    if (ptrace(PTRACE_ATTACH, g_pid, 0, 0) < 0) {
-        logln("[RAPZ] attach gagal: %s", strerror(errno));
-        return 5;
-    }
-    { int st2; waitpid(g_pid, &st2, __WALL); }
-    logln("[RAPZ] attached");
+          (unsigned long long)libc_base, (unsigned long long)libdl_base,
+          (unsigned long long)off_mmap, (unsigned long long)off_dlopen);
 
     struct a64_regs orig;
     if (ptrace_getregs(&orig) < 0) {

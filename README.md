@@ -43,13 +43,29 @@ The script writes `libsheyan.so` and `rapzinj` into `/data/local/tmp/rap/`, star
 
 The script checks the latest GitHub Release tag on every run and downloads `ffadv.sh` when a newer build exists.
 
-- Check: `https://api.github.com/repos/tes12886-sudo/ffadv-rapz/releases/latest` (`tag_name`, e.g. `v13` → `rapz-v13`)
+- Check: `https://api.github.com/repos/tes12886-sudo/ffadv-rapz/releases/latest` (`tag_name`, e.g. `v14` → `rapz-v14`)
 - Fallback check: `https://raw.githubusercontent.com/tes12886-sudo/ffadv-rapz/main/VERSION`
 - Download: `https://github.com/tes12886-sudo/ffadv-rapz/releases/latest/download/ffadv.sh`
 - Fallback download: raw `main/ffadv.sh`
 - Skip check with `sh /data/local/tmp/rap/ffadv.sh --no-update`
 
 It also normalizes any duplicate filename such as `ffadv (1).sh` into `/data/local/tmp/rap/ffadv.sh` before continuing.
+
+## Interactive menu
+
+```sh
+sh /data/local/tmp/rap/ffadv.sh menu
+```
+
+Menu options:
+
+- `1` — attach game and inject
+- `2` — unattach (release ptrace, delete payload, game keeps running)
+- `3` — show log
+- `4` — uninstall / exit injector (delete all files)
+- `5` — exit menu
+
+Direct commands also work: `unattach`, `uninstall`, `exit`, `--no-update`.
 
 Every run writes a detailed log to:
 
