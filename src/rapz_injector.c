@@ -68,10 +68,12 @@ static int module_base(pid_t pid, const char *name, char *path_out, size_t path_
     uintptr_t base = 0;
     while (fgets(line, sizeof line, f)) {
         if (strstr(line, name)) {
-            uintptr_t start, off;
+            unsigned long long start_ll = 0, off_ll = 0;
             char perms[8], path[512] = {0};
-            if (sscanf(line, "%lx-%*lx %4s %lx %*s %*s %511s",
-                       &start, perms, &off, path) >= 3) {
+            if (sscanf(line, "%llx-%*llx %4s %llx %*s %*s %511s",
+                       &start_ll, perms, &off_ll, path) >= 3) {
+                uintptr_t start = (uintptr_t)start_ll;
+                uintptr_t off = (uintptr_t)off_ll;
                 if (off == 0 && strstr(perms, "r")) {
                     base = start;
                     if (path_out && path[0] == '/') snprintf(path_out, path_sz, "%s", path);
@@ -286,7 +288,7 @@ int main(int argc, char **argv) {
     setvbuf(stderr, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
 
-    logln("[RAPZ] build=rapz-v12 === start ===");
+    logln("[RAPZ] build=rapz-v13 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), so, pkg);
 
