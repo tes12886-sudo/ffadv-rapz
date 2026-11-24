@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-VERSION = "rapz-v11"
+VERSION = "rapz-v12"
 
 ROOT = Path(r"C:\Users\runneradmin\Downloads\projecr")
 REPO = ROOT / "ffadv-rapz"

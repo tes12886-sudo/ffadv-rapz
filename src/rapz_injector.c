@@ -1,3 +1,7 @@
+// FULL RAPZ arm64 ptrace injector — pola rapzz-ffth (libdl.so + return-to-zero trap).
+// Usage: rapzinj </absolute/path/libsheyan.so>
+// Method: register hijack -> mmap() RW -> write path -> dlopen(), symbols from
+// target's on-disk libc.so and libdl.so so addresses match the device exactly.
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <dirent.h>
@@ -10,50 +14,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
-#include <sys/syscall.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define PT_PEEKDATA 2
-#define PT_POKEDATA 5
-#define PT_GETREGS 12
-#define PT_SETREGS 13
-#define PTRACE_GETREGSET_VAL 0x4204
-#define PTRACE_SETREGSET_VAL 0x4205
-#define PTRACE_SEIZE_VAL 0x4206
-#define PTRACE_INTERRUPT_VAL 0x4207
-#define NT_PRSTATUS 1
-
-#define RTLD_NOW_VAL   0x00000002UL
-#define RTLD_GLOBAL_VAL 0x00000100UL
-#define STUB_OFF 0x80UL
-
-#define PROT_RWX 7
-#define PROT_RX  5
-#define MAP_PRIVATE_ANON 0x22
-
-#ifndef __NR_mmap
-#define __NR_mmap 222
-#endif
-#ifndef __NR_mprotect
-#define __NR_mprotect 226
-#endif
-#ifndef __NR_process_vm_readv
-#define __NR_process_vm_readv 270
-#endif
+#define NT_PRSTATUS_VAL 1
 #ifndef __NR_process_vm_writev
 #define __NR_process_vm_writev 271
 #endif
 
-struct rapz_regs {
-    uint64_t x[31];
+struct a64_regs {
+    uint64_t regs[31];
     uint64_t sp;
     uint64_t pc;
     uint64_t pstate;
 };
+
+static pid_t g_pid = 0;
 
 static void logln(const char *fmt, ...) {
     va_list ap;
@@ -69,94 +49,212 @@ static const char *sig_name(int sig) {
         case SIGTRAP: return "SIGTRAP";
         case SIGSEGV: return "SIGSEGV";
         case SIGSTOP: return "SIGSTOP";
-        case SIGBUS: return "SIGBUS";
-        case SIGILL: return "SIGILL";
+        case SIGBUS:  return "SIGBUS";
+        case SIGILL:  return "SIGILL";
+        case SIGABRT: return "SIGABRT";
+        case SIGCHLD: return "SIGCHLD";
         default: return "SIG?";
     }
 }
 
-static int get_regs(pid_t pid, struct rapz_regs *r) {
-    memset(r, 0, sizeof(*r));
-    if (ptrace(PT_GETREGS, pid, 0, r) == 0) {
-        logln("[RAPZ] GETREGS OK");
+static int module_base(pid_t pid, const char *name, char *path_out, size_t path_sz) {
+    char maps[64], line[1024];
+    snprintf(maps, sizeof maps, "/proc/%d/maps", pid);
+    FILE *f = fopen(maps, "r");
+    if (!f) {
+        logln("[RAPZ] buka %s gagal: %s", maps, strerror(errno));
         return 0;
     }
-    logln("[RAPZ] GETREGS gagal: %s, coba GETREGSET...", strerror(errno));
-
-    struct iovec io = { (void *)r, sizeof(*r) };
-    if (ptrace(PTRACE_GETREGSET_VAL, pid, (void *)NT_PRSTATUS, &io) == 0) {
-        logln("[RAPZ] GETREGSET OK iov_len=%zu", (size_t)io.iov_len);
-        return 0;
+    uintptr_t base = 0;
+    while (fgets(line, sizeof line, f)) {
+        if (strstr(line, name)) {
+            uintptr_t start, off;
+            char perms[8], path[512] = {0};
+            if (sscanf(line, "%lx-%*lx %4s %lx %*s %*s %511s",
+                       &start, perms, &off, path) >= 3) {
+                if (off == 0 && strstr(perms, "r")) {
+                    base = start;
+                    if (path_out && path[0] == '/') snprintf(path_out, path_sz, "%s", path);
+                    logln("[RAPZ] module %-10s base=%llx path=%s (%s)",
+                          name, (unsigned long long)base, path_out ? path_out : "-", line);
+                    break;
+                }
+            }
+        }
     }
-    logln("[RAPZ] GETREGSET gagal: %s", strerror(errno));
-    return -1;
+    fclose(f);
+    if (!base) logln("[RAPZ] module %s TIDAK ditemukan", name);
+    return (uintptr_t)base;
 }
 
-static int set_regs(pid_t pid, const struct rapz_regs *r) {
-    if (ptrace(PT_SETREGS, pid, 0, (void *)r) == 0) {
-        logln("[RAPZ] SETREGS OK");
+static uintptr_t symbol_offset(const char *elf_path, const char *sym) {
+    int fd = open(elf_path, O_RDONLY);
+    if (fd < 0) {
+        logln("[RAPZ] ELF buka gagal: %s (%s)", elf_path, strerror(errno));
         return 0;
     }
-    logln("[RAPZ] SETREGS gagal: %s, coba SETREGSET...", strerror(errno));
+    off_t sz = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
+    if (sz <= 0 || sz > (off_t)64 * 1024 * 1024) { close(fd); return 0; }
+    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    if (!buf) { close(fd); return 0; }
+    ssize_t rd = read(fd, buf, (size_t)sz);
+    close(fd);
+    if (rd != sz) { free(buf); return 0; }
 
-    struct iovec io = { (void *)r, sizeof(*r) };
-    if (ptrace(PTRACE_SETREGSET_VAL, pid, (void *)NT_PRSTATUS, &io) == 0) {
-        logln("[RAPZ] SETREGSET OK iov_len=%zu", (size_t)io.iov_len);
+    if (buf[0] != 0x7f || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F' || buf[4] != 2) {
+        logln("[RAPZ] ELF bukan 64-bit: %s", elf_path);
+        free(buf);
         return 0;
     }
-    logln("[RAPZ] SETREGSET gagal: %s", strerror(errno));
-    return -1;
+
+    uint64_t shoff = 0;
+    uint16_t shentsize = 64, shnum = 0, shstrndx = 0;
+    memcpy(&shoff, buf + 0x28, 8);
+    memcpy(&shentsize, buf + 0x3A, 2);
+    memcpy(&shnum, buf + 0x3C, 2);
+    memcpy(&shstrndx, buf + 0x3E, 2);
+    if (!shentsize) shentsize = 64;
+
+    uintptr_t result = 0;
+    for (uint16_t i = 0; i < shnum; i++) {
+        uint64_t p = shoff + (uint64_t)i * shentsize;
+        if (p + 64 > (uint64_t)sz) continue;
+
+        uint32_t sh_type = 0, sh_link = 0;
+        uint64_t sh_off = 0, sh_size = 0, sh_entsize = 0;
+        memcpy(&sh_type, buf + p + 4, 4);
+        memcpy(&sh_off, buf + p + 0x18, 8);
+        memcpy(&sh_size, buf + p + 0x20, 8);
+        memcpy(&sh_link, buf + p + 0x28, 4);
+        memcpy(&sh_entsize, buf + p + 0x38, 8);
+
+        if (sh_type != 11 && sh_type != 2) continue;
+        if (!sh_entsize) sh_entsize = 24;
+        if (sh_off + sh_size > (uint64_t)sz) continue;
+        if ((uint64_t)sh_link * shentsize + shoff + 64 > (uint64_t)sz) continue;
+
+        uint64_t stroff = 0, strsz = 0;
+        memcpy(&stroff, buf + shoff + (uint64_t)sh_link * shentsize + 0x18, 8);
+        memcpy(&strsz, buf + shoff + (uint64_t)sh_link * shentsize + 0x20, 8);
+        if (stroff + strsz > (uint64_t)sz) continue;
+
+        size_t n = (size_t)(sh_size / sh_entsize);
+        for (size_t j = 0; j < n; j++) {
+            uint64_t sp = sh_off + (uint64_t)j * sh_entsize;
+            if (sp + 24 > (uint64_t)sz) break;
+            uint32_t nameoff = 0;
+            uint64_t value = 0;
+            memcpy(&nameoff, buf + sp, 4);
+            memcpy(&value, buf + sp + 8, 8);
+            if (!nameoff || !value) continue;
+            if (nameoff >= strsz) continue;
+            const char *symname = (const char *)(buf + stroff + nameoff);
+            if (strcmp(symname, sym) == 0) {
+                result = (uintptr_t)value;
+                logln("[RAPZ] ELF sym %-8s off=%llx path=%s",
+                      sym, (unsigned long long)result, elf_path);
+                free(buf);
+                return result;
+            }
+        }
+    }
+    free(buf);
+    logln("[RAPZ] ELF sym %s TIDAK ditemukan di %s", sym, elf_path);
+    return 0;
 }
 
-static void log_status(const char *tag, int status) {
-    if (WIFSTOPPED(status)) {
-        logln("[RAPZ][%s] stopped: %s (%d)", tag, sig_name(WSTOPSIG(status)), WSTOPSIG(status));
-    } else if (WIFEXITED(status)) {
-        logln("[RAPZ][%s] exited: %d", tag, WEXITSTATUS(status));
-    } else if (WIFSIGNALED(status)) {
-        logln("[RAPZ][%s] killed: %s (%d)", tag, sig_name(WTERMSIG(status)), WTERMSIG(status));
-    } else {
-        logln("[RAPZ][%s] status=0x%x", tag, status);
+static int ptrace_getregs(struct a64_regs *r) {
+    struct iovec io = { (void *)r, sizeof(*r) };
+    return ptrace(PTRACE_GETREGSET, g_pid, (void *)NT_PRSTATUS_VAL, &io);
+}
+
+static int ptrace_setregs(struct a64_regs *r) {
+    struct iovec io = { (void *)r, sizeof(*r) };
+    return ptrace(PTRACE_SETREGSET, g_pid, (void *)NT_PRSTATUS_VAL, &io);
+}
+
+static int wait_call_stop(void) {
+    int st = 0;
+    for (;;) {
+        if (waitpid(g_pid, &st, __WALL) < 0) {
+            logln("[RAPZ] waitpid call gagal: %s", strerror(errno));
+            return -1;
+        }
+        if (!WIFSTOPPED(st)) {
+            logln("[RAPZ] call tidak stopped status=0x%x", st);
+            return -1;
+        }
+        int sig = WSTOPSIG(st);
+        logln("[RAPZ] call stopped: %s (%d)", sig_name(sig), sig);
+        if (sig == SIGSEGV || sig == SIGTRAP || sig == SIGABRT ||
+            sig == SIGILL || sig == SIGBUS) return sig;
+        if (ptrace(PTRACE_CONT, g_pid, 0, (void *)(long)sig) != 0) {
+            logln("[RAPZ] forward %s gagal: %s", sig_name(sig), strerror(errno));
+            return -1;
+        }
     }
+}
+
+static uint64_t call_func(uint64_t func, uint64_t a0, uint64_t a1, uint64_t a2,
+                          uint64_t a3, uint64_t a4, uint64_t a5,
+                          struct a64_regs *orig) {
+    struct a64_regs r = *orig;
+    r.pc = func;
+    r.regs[0] = a0; r.regs[1] = a1; r.regs[2] = a2;
+    r.regs[3] = a3; r.regs[4] = a4; r.regs[5] = a5;
+    r.regs[30] = 0;
+    r.sp &= ~0xFULL;
+
+    if (ptrace_setregs(&r) != 0) {
+        logln("[RAPZ] set regs call=%llx gagal: %s",
+              (unsigned long long)func, strerror(errno));
+        return 0;
+    }
+    if (ptrace(PTRACE_CONT, g_pid, 0, 0) != 0) {
+        logln("[RAPZ] CONT call=%llx gagal: %s",
+              (unsigned long long)func, strerror(errno));
+        return 0;
+    }
+    if (wait_call_stop() < 0) return 0;
+
+    struct a64_regs out;
+    if (ptrace_getregs(&out) != 0) {
+        logln("[RAPZ] get regs call=%llx gagal", (unsigned long long)func);
+        return 0;
+    }
+    logln("[RAPZ] call %llx -> x0=%llx",
+          (unsigned long long)func, (unsigned long long)out.regs[0]);
+    return out.regs[0];
+}
+
+static void detach_run(void) {
+    ptrace(PTRACE_CONT, g_pid, 0, 0);
+    ptrace(PTRACE_DETACH, g_pid, 0, 0);
 }
 
 static pid_t find_pid(const char *target) {
     DIR *d = opendir("/proc");
-    if (!d) {
-        logln("[RAPZ] opendir(/proc) gagal: %s", strerror(errno));
-        return -1;
-    }
-
-    pid_t exact = -1;
-    pid_t fallback = -1;
+    if (!d) return -1;
+    pid_t exact = -1, fallback = -1;
     struct dirent *e;
-
     while ((e = readdir(d)) != NULL) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-
         char path[256];
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", e->d_name);
+        snprintf(path, sizeof path, "/proc/%s/cmdline", e->d_name);
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
-
         char buf[1024] = {0};
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
         close(fd);
         if (n <= 0) continue;
-        buf[n] = '\0';
-
-        if (strstr(buf, target) == NULL) continue;
-
+        buf[n] = 0;
+        if (!strstr(buf, target)) continue;
         pid_t pid = (pid_t)atoi(e->d_name);
         logln("[RAPZ] kandidat pid=%d cmdline=%s", pid, buf);
-
-        if (strcmp(buf, target) == 0) {
-            exact = pid;
-            break;
-        }
+        if (!strcmp(buf, target)) { exact = pid; break; }
         if (fallback < 0) fallback = pid;
     }
-
     closedir(d);
     pid_t chosen = exact > 0 ? exact : fallback;
     logln("[RAPZ] pid terpilih=%d (%s)", chosen,
@@ -166,16 +264,12 @@ static pid_t find_pid(const char *target) {
 
 static int has_mapping(pid_t pid, const char *needle) {
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
     FILE *f = fopen(path, "r");
-    if (!f) {
-        logln("[RAPZ] buka %s gagal: %s", path, strerror(errno));
-        return 0;
-    }
-
+    if (!f) return 0;
     char line[1024];
     int found = 0;
-    while (fgets(line, sizeof(line), f)) {
+    while (fgets(line, sizeof line, f)) {
         if (strstr(line, needle)) {
             logln("[RAPZ] mapping: %s", line);
             found = 1;
@@ -186,636 +280,20 @@ static int has_mapping(pid_t pid, const char *needle) {
     return found;
 }
 
-static void copy_map_path(const char *line, char *out, size_t cap) {
-    if (!out || cap == 0) return;
-    const char *p = strstr(line, "/");
-    size_t i = 0;
-    if (!p) { out[0] = 0; return; }
-    while (*p && *p != '\n' && *p != '\r' && *p != ' ' && i + 1 < cap) {
-        out[i++] = *p++;
-    }
-    out[i] = 0;
-}
-
-static uintptr_t libc_base(pid_t pid, const char *label, char *path_out, size_t path_cap) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        logln("[RAPZ] buka %s gagal: %s", path, strerror(errno));
-        return 0;
-    }
-
-    char line[1024];
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, "/libc.so") && strstr(line, "r--p") && strstr(line, " 00000000 ")) {
-            if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
-                copy_map_path(line, path_out, path_cap);
-                logln("[RAPZ] %s libc base=%llx path=%s (%s)", label,
-                      (unsigned long long)base, path_out, line);
-                break;
-            }
-        }
-    }
-
-    if (!base) {
-        rewind(f);
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "/libc.so")) {
-                if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
-                    copy_map_path(line, path_out, path_cap);
-                    logln("[RAPZ] %s libc base fallback=%llx path=%s (%s)", label,
-                          (unsigned long long)base, path_out, line);
-                    break;
-                }
-            }
-        }
-    }
-
-    fclose(f);
-    if (!base) logln("[RAPZ] %s libc base TIDAK ditemukan", label);
-    return base;
-}
-
-static uintptr_t module_base(pid_t pid, const char *label, const char *needle,
-                             char *path_out, size_t path_cap) {
-    char maps[64];
-    snprintf(maps, sizeof(maps), "/proc/%d/maps", pid);
-    FILE *f = fopen(maps, "r");
-    if (!f) {
-        logln("[RAPZ] buka %s gagal: %s", maps, strerror(errno));
-        return 0;
-    }
-
-    char line[1024];
-    uintptr_t base = 0;
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, needle) && strstr(line, "r--p") && strstr(line, " 00000000 ")) {
-            if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
-                copy_map_path(line, path_out, path_cap);
-                logln("[RAPZ] %s base=%llx path=%s (%s)", label,
-                      (unsigned long long)base, path_out, line);
-                break;
-            }
-        }
-    }
-    if (!base) {
-        rewind(f);
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, needle)) {
-                if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
-                    copy_map_path(line, path_out, path_cap);
-                    logln("[RAPZ] %s base fallback=%llx path=%s (%s)", label,
-                          (unsigned long long)base, path_out, line);
-                    break;
-                }
-            }
-        }
-    }
-    fclose(f);
-
-    if (!path_out || !path_out[0]) {
-        const char *candidates[] = {
-            "/system/bin/linker64",
-            "/apex/com.android.runtime/bin/linker64"
-        };
-        for (unsigned i = 0; i < 2; i++) {
-            struct stat s;
-            if (stat(candidates[i], &s) == 0) {
-                snprintf(path_out, path_cap, "%s", candidates[i]);
-                logln("[RAPZ] %s path fallback=%s", label, path_out);
-                break;
-            }
-        }
-    }
-    if (!base) logln("[RAPZ] %s base TIDAK ditemukan", label);
-    return base;
-}
-
-static long peek_word(pid_t pid, uintptr_t addr) {
-    errno = 0;
-    return ptrace(PT_PEEKDATA, pid, (void *)addr, 0);
-}
-
-static int read_mem(pid_t pid, uintptr_t addr, void *dst, size_t len) {
-    struct iovec local = { (void *)dst, len };
-    struct iovec remote = { (void *)addr, len };
-    ssize_t n = (ssize_t)syscall(__NR_process_vm_readv, pid, &local, 1, &remote, 1, 0);
-    if (n == (ssize_t)len) return 0;
-    logln("[RAPZ] process_vm_readv gagal: n=%zd err=%s", n, strerror(errno));
-    return -1;
-}
-
-static int write_mem(pid_t pid, uintptr_t addr, const void *data, size_t len) {
-    struct iovec local = { (void *)data, len };
-    struct iovec remote = { (void *)addr, len };
-    ssize_t n = (ssize_t)syscall(__NR_process_vm_writev, pid, &local, 1, &remote, 1, 0);
-    if (n == (ssize_t)len) {
-        logln("[RAPZ] write_mem vm_writev OK addr=%llx len=%zu",
-              (unsigned long long)addr, len);
-        return 0;
-    }
-
-    logln("[RAPZ] process_vm_writev gagal: n=%zd err=%s, fallback ptrace",
-          n, strerror(errno));
-
-    const unsigned char *src = (const unsigned char *)data;
-    size_t off = 0;
-    while (off < len) {
-        uintptr_t cur = addr + off;
-        uintptr_t aligned = cur & ~7ULL;
-        size_t in = (size_t)(cur - aligned);
-        size_t chunk = 8 - in;
-        if (chunk > len - off) chunk = len - off;
-
-        uint64_t word = 0;
-        long old = peek_word(pid, aligned);
-        if (old != -1 || errno == 0) word = (uint64_t)old;
-        memcpy((unsigned char *)&word + in, src + off, chunk);
-
-        if (ptrace(PT_POKEDATA, pid, (void *)aligned, (void *)word) != 0) {
-            logln("[RAPZ] POKEDATA gagal addr=%llx: %s",
-                  (unsigned long long)aligned, strerror(errno));
-            return -1;
-        }
-        off += chunk;
-    }
-    return 0;
-}
-
-static uint16_t rd16(const unsigned char *p) {
-    return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
-}
-
-static uint32_t rd32(const unsigned char *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-
-static uint64_t rd64(const unsigned char *p) {
-    return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
-}
-
-static uint32_t gnu_hash(const unsigned char *name) {
-    uint32_t h = 5381;
-    while (*name) h = h * 33 + *name++;
-    return h;
-}
-
-static uintptr_t scan_elf_symbols(unsigned char *buf, uint64_t fsz,
-                                  uint64_t symoff, uint64_t symsz,
-                                  uint64_t stroff, uint64_t strsz,
-                                  uint64_t entsize,
-                                  const char *const *names, unsigned nnames,
-                                  const char *path) {
-    if (!entsize) entsize = 24;
-    if (symoff + symsz > fsz || stroff + strsz > fsz) return 0;
-    uint64_t count = symsz / entsize;
-
-    for (uint64_t j = 0; j < count; j++) {
-        const unsigned char *sym = buf + symoff + j * entsize;
-        uint32_t nameoff = rd32(sym);
-        uint8_t info = sym[4];
-        uint64_t value = rd64(sym + 8);
-        if (!value) continue;
-        if (nameoff >= strsz) continue;
-        if ((info & 0x0f) != 2) continue;
-        const char *symname = (const char *)(buf + stroff + nameoff);
-        for (unsigned k = 0; k < nnames; k++) {
-            if (strcmp(symname, names[k]) == 0) {
-                logln("[RAPZ] ELF sym %-9s off=%llx path=%s",
-                      names[k], (unsigned long long)value, path);
-                return (uintptr_t)value;
-            }
-        }
-    }
-    return 0;
-}
-
-static uintptr_t elf_dynamic_offset(unsigned char *buf, uint64_t fsz,
-                                    uint32_t tag, uint64_t *out) {
-    uint64_t phoff = rd64(buf + 0x20);
-    uint16_t phentsize = rd16(buf + 0x36);
-    uint16_t phnum = rd16(buf + 0x38);
-    if (!phentsize) phentsize = 56;
-
-    for (uint16_t i = 0; i < phnum; i++) {
-        uint64_t p = phoff + (uint64_t)i * phentsize;
-        if (p + 56 > fsz) continue;
-        const unsigned char *ph = buf + p;
-        if (rd32(ph) != 2) continue;
-        uint64_t off = rd64(ph + 8);
-        uint64_t filesz = rd64(ph + 32);
-        if (off + filesz > fsz) continue;
-        for (uint64_t d = off; d + 16 <= off + filesz; d += 16) {
-            uint64_t dtag = rd64(buf + d);
-            if (dtag == 0) return 0;
-            if (dtag == tag) { *out = rd64(buf + d + 8); return 1; }
-        }
-    }
-    return 0;
-}
-
-static uint64_t vaddr_to_off(unsigned char *buf, uint64_t fsz, uint64_t va) {
-    uint64_t phoff = rd64(buf + 0x20);
-    uint16_t phentsize = rd16(buf + 0x36);
-    uint16_t phnum = rd16(buf + 0x38);
-    if (!phentsize) phentsize = 56;
-    for (uint16_t i = 0; i < phnum; i++) {
-        uint64_t p = phoff + (uint64_t)i * phentsize;
-        if (p + 56 > fsz) continue;
-        const unsigned char *ph = buf + p;
-        if (rd32(ph) != 1) continue;
-        uint64_t vaddr = rd64(ph + 16);
-        uint64_t filesz = rd64(ph + 32);
-        uint64_t off = rd64(ph + 8);
-        if (va >= vaddr && va < vaddr + filesz) return off + (va - vaddr);
-    }
-    return 0;
-}
-
-static uintptr_t elf_gnu_hash_lookup(unsigned char *buf, uint64_t fsz,
-                                     uint64_t hash_va, uint64_t str_va,
-                                     const char *const *names, unsigned nnames,
-                                     const char *path) {
-    uint64_t hoff = vaddr_to_off(buf, fsz, hash_va);
-    uint64_t soff = vaddr_to_off(buf, fsz, str_va);
-    if (!hoff || !soff || hoff + 16 > fsz) return 0;
-
-    uint32_t nbuckets = rd32(buf + hoff);
-    uint32_t symoffset = rd32(buf + hoff + 4);
-    uint32_t bloom_size = rd32(buf + hoff + 8);
-
-    uint64_t buckets_off = hoff + 16 + (uint64_t)bloom_size * 8;
-    uint64_t chain_off = buckets_off + (uint64_t)nbuckets * 4;
-    if (buckets_off + nbuckets * 4 > fsz) return 0;
-
-    for (unsigned k = 0; k < nnames; k++) {
-        uint32_t h = gnu_hash((const unsigned char *)names[k]);
-        uint32_t bucket = rd32(buf + buckets_off + (h % nbuckets) * 4);
-        if (bucket < symoffset) continue;
-        uint64_t idx = bucket;
-        while (idx < symoffset + 1000000ULL) {
-            uint64_t coff = chain_off + (idx - symoffset) * 4;
-            if (coff + 4 > fsz) break;
-            uint32_t ch = rd32(buf + coff);
-            if ((ch | 1U) == (h | 1U)) {
-                uint64_t symva = 0;
-                uint64_t symtab = 0;
-                if (!elf_dynamic_offset(buf, fsz, 6, &symtab)) break;
-                symva = symtab + idx * 24;
-                uint64_t symoff = vaddr_to_off(buf, fsz, symva);
-                if (!symoff || symoff + 24 > fsz) break;
-                const unsigned char *sym = buf + symoff;
-                uint32_t nameoff = rd32(sym);
-                uint64_t value = rd64(sym + 8);
-                if (value && nameoff) {
-                    const char *symname = (const char *)(buf + soff + nameoff);
-                    if (strcmp(symname, names[k]) == 0) {
-                        logln("[RAPZ] GNU-hash sym %-9s off=%llx path=%s",
-                              names[k], (unsigned long long)value, path);
-                        return (uintptr_t)value;
-                    }
-                }
-            }
-            if (ch & 1U) break;
-            idx++;
-        }
-    }
-    return 0;
-}
-
-static uintptr_t elf_symbol_offset(const char *path, const char *name, const char *alias) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        logln("[RAPZ] ELF buka gagal: %s (%s)", path, strerror(errno));
-        return 0;
-    }
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
-    long fsz_l = ftell(f);
-    rewind(f);
-    if (fsz_l < 64) { fclose(f); return 0; }
-    uint64_t fsz = (uint64_t)fsz_l;
-
-    unsigned char *buf = (unsigned char *)malloc((size_t)fsz);
-    if (!buf) { fclose(f); return 0; }
-    if (fread(buf, 1, (size_t)fsz, f) != (size_t)fsz) {
-        free(buf); fclose(f); return 0;
-    }
-    fclose(f);
-
-    if (buf[0] != 0x7f || buf[1] != 'E' || buf[2] != 'L' || buf[3] != 'F' || buf[4] != 2) {
-        logln("[RAPZ] ELF bukan 64-bit: %s", path);
-        free(buf);
-        return 0;
-    }
-
-    const char *names[2] = { name, alias };
-    unsigned nnames = alias ? 2 : 1;
-
-    uint64_t shoff = rd64(buf + 0x28);
-    uint16_t shentsize = rd16(buf + 0x3A);
-    uint16_t shnum = rd16(buf + 0x3C);
-    if (!shentsize) shentsize = 64;
-
-    uintptr_t found = 0;
-    const uint32_t wanted[] = { 11, 2 };
-    for (unsigned w = 0; w < 2 && !found; w++) {
-        for (uint16_t i = 0; i < shnum; i++) {
-            uint64_t shp = shoff + (uint64_t)i * shentsize;
-            if (shp + 64 > (uint64_t)fsz) continue;
-
-            const unsigned char *sh = buf + shp;
-            uint32_t type = rd32(sh + 4);
-            if (type != wanted[w]) continue;
-
-            uint32_t stridx = rd32(sh + 0x28);
-            if ((uint64_t)stridx * shentsize + shoff + 64 > (uint64_t)fsz) continue;
-            const unsigned char *strsh = buf + shoff + (uint64_t)stridx * shentsize;
-            uint64_t stroff = rd64(strsh + 0x18);
-            uint64_t strsz = rd64(strsh + 0x20);
-            uint64_t symoff = rd64(sh + 0x18);
-            uint64_t symsz = rd64(sh + 0x20);
-            uint64_t entsize = rd64(sh + 0x38);
-
-            found = scan_elf_symbols(buf, fsz, symoff, symsz, stroff, strsz,
-                                     entsize, names, nnames, path);
-            if (found) break;
-        }
-    }
-
-    if (!found) {
-        uint64_t strtab = 0, symtab = 0, syment = 0, hashtab = 0, gnuhash = 0;
-        elf_dynamic_offset(buf, fsz, 5, &strtab);
-        elf_dynamic_offset(buf, fsz, 6, &symtab);
-        elf_dynamic_offset(buf, fsz, 11, &syment);
-        elf_dynamic_offset(buf, fsz, 4, &hashtab);
-        elf_dynamic_offset(buf, fsz, 0x6ffffef5, &gnuhash);
-
-        if (symtab && strtab) {
-            uint64_t str_off = vaddr_to_off(buf, fsz, strtab);
-            uint64_t sym_off = vaddr_to_off(buf, fsz, symtab);
-            uint64_t nsyms = 0;
-            if (gnuhash) {
-                uint64_t gh = vaddr_to_off(buf, fsz, gnuhash);
-                if (gh && gh + 8 <= fsz) {
-                    uint32_t nb = rd32(buf + gh);
-                    uint32_t symoffset = rd32(buf + gh + 4);
-                    uint32_t mx = symoffset;
-                    uint64_t coff = gh + 16 + 8 + (uint64_t)nb * 4;
-                    for (uint32_t i = 0; i < 200000 && coff + 4 <= fsz; i++, coff += 4) {
-                        uint32_t ch = rd32(buf + coff);
-                        if (ch & 1U) { mx = symoffset + i; break; }
-                    }
-                    nsyms = mx + 1;
-                }
-            }
-            if (!nsyms && hashtab) {
-                uint64_t ht = vaddr_to_off(buf, fsz, hashtab);
-                if (ht + 8 <= fsz) nsyms = rd32(buf + ht + 4);
-            }
-            if (!nsyms) nsyms = 100000;
-            if (str_off && sym_off) {
-                found = scan_elf_symbols(buf, fsz, sym_off, nsyms * (syment ? syment : 24),
-                                         str_off, fsz - str_off, syment ? syment : 24,
-                                         names, nnames, path);
-            }
-        }
-        if (!found && gnuhash && strtab) {
-            found = elf_gnu_hash_lookup(buf, fsz, gnuhash, strtab, names, nnames, path);
-        }
-    }
-
-    if (!found) {
-        logln("[RAPZ] ELF sym %s TIDAK ditemukan di %s", name, path);
-    }
-    free(buf);
-    return found;
-}
-
-static uintptr_t find_svc_gadget(pid_t pid, const char *libc_path) {
-    char maps[64];
-    snprintf(maps, sizeof(maps), "/proc/%d/maps", pid);
-    FILE *f = fopen(maps, "r");
-    if (!f) {
-        logln("[RAPZ] buka %s gagal: %s", maps, strerror(errno));
-        return 0;
-    }
-
-    uintptr_t start = 0, end = 0;
-    char line[1024];
-    while (fgets(line, sizeof(line), f)) {
-        if (strstr(line, libc_path) && strstr(line, "r-xp")) {
-            if (sscanf(line, "%lx-%lx", (unsigned long *)&start, (unsigned long *)&end) == 2) break;
-        }
-    }
-    if (!start) {
-        rewind(f);
-        while (fgets(line, sizeof(line), f)) {
-            if (strstr(line, "/libc.so") && strstr(line, "r-xp")) {
-                sscanf(line, "%lx-%lx", (unsigned long *)&start, (unsigned long *)&end);
-                break;
-            }
-        }
-    }
-    fclose(f);
-
-    if (!start || end <= start) {
-        logln("[RAPZ] segmen r-xp libc tidak ditemukan");
-        return 0;
-    }
-    logln("[RAPZ] libc r-xp=%llx-%llx", (unsigned long long)start, (unsigned long long)end);
-
-    const size_t CHUNK = 0x8000;
-    unsigned char *buf = (unsigned char *)malloc(CHUNK + 4);
-    if (!buf) return 0;
-
-    for (uintptr_t addr = start; addr + 4 <= end; addr += CHUNK) {
-        size_t len = end - addr;
-        if (len > CHUNK) len = CHUNK;
-        if (read_mem(pid, addr, buf, len) != 0) continue;
-        for (size_t i = 0; i + 4 <= len; i += 4) {
-            if (buf[i] == 0x01 && buf[i + 1] == 0x00 &&
-                buf[i + 2] == 0x00 && buf[i + 3] == 0xd4) {
-                uintptr_t gadget = addr + i;
-                logln("[RAPZ] svc#0 gadget=%llx bytes=01 00 00 d4",
-                      (unsigned long long)gadget);
-                free(buf);
-                return gadget;
-            }
-        }
-    }
-    free(buf);
-
-    for (uintptr_t a = start; a + 4 <= end; a += 4) {
-        long w = peek_word(pid, a);
-        if ((uint32_t)w == 0xd4000001U) {
-            logln("[RAPZ] svc#0 gadget fallback=%llx", (unsigned long long)a);
-            return a;
-        }
-    }
-
-    logln("[RAPZ] svc#0 gadget TIDAK ditemukan");
-    return 0;
-}
-
-static uintptr_t remote_syscall(pid_t pid, const struct rapz_regs *original,
-                                uintptr_t gadget, uint64_t nr,
-                                uint64_t a0, uint64_t a1, uint64_t a2,
-                                uint64_t a3, uint64_t a4, uint64_t a5) {
-    struct rapz_regs r = *original;
-    r.x[0] = a0; r.x[1] = a1; r.x[2] = a2;
-    r.x[3] = a3; r.x[4] = a4; r.x[5] = a5;
-    r.x[8] = nr;
-    r.pc = gadget;
-
-    if (set_regs(pid, &r) != 0) {
-        logln("[RAPZ] set regs syscall nr=%llu gagal", (unsigned long long)nr);
-        return 0;
-    }
-    logln("[RAPZ] remote syscall nr=%llu gadget=%llx",
-          (unsigned long long)nr, (unsigned long long)gadget);
-
-    int entry_ok = 0;
-    for (int i = 0; i < 4; i++) {
-        if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
-            logln("[RAPZ] PTRACE_SYSCALL entry gagal: %s", strerror(errno));
-            return 0;
-        }
-        int status = 0;
-        if (waitpid(pid, &status, 0) < 0) {
-            logln("[RAPZ] waitpid syscall entry gagal: %s", strerror(errno));
-            return 0;
-        }
-        log_status("syscall-entry", status);
-        if (get_regs(pid, &r) != 0) return 0;
-        logln("[RAPZ] syscall-entry pc=%llx x8=%llu",
-              (unsigned long long)r.pc, (unsigned long long)r.x[8]);
-        if (r.x[8] == nr) { entry_ok = 1; break; }
-    }
-    if (!entry_ok) {
-        logln("[RAPZ] syscall entry nr=%llu tidak ketemu", (unsigned long long)nr);
-        return 0;
-    }
-
-    if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
-        logln("[RAPZ] PTRACE_SYSCALL exit gagal: %s", strerror(errno));
-        return 0;
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        logln("[RAPZ] waitpid syscall exit gagal: %s", strerror(errno));
-        return 0;
-    }
-    log_status("syscall-exit", status);
-    if (get_regs(pid, &r) != 0) return 0;
-
-    uintptr_t result = (uintptr_t)r.x[0];
-    logln("[RAPZ] syscall nr=%llu result=%llx",
-          (unsigned long long)nr, (unsigned long long)result);
-    return result;
-}
-
-static int is_syscall_error(uintptr_t v) {
-    return ((int64_t)v < 0 && v > (uintptr_t)-4096);
-}
-
-static uintptr_t remote_mmap(pid_t pid, const struct rapz_regs *original, uintptr_t gadget) {
-    uintptr_t mem = remote_syscall(pid, original, gadget, __NR_mmap,
-                                   0, 0x1000, PROT_RWX, MAP_PRIVATE_ANON,
-                                   (uint64_t)-1, 0);
-    if (!is_syscall_error(mem) && mem >= 0x10000) {
-        logln("[RAPZ] mmap RWX berhasil: %llx", (unsigned long long)mem);
-        return mem;
-    }
-
-    int err = (int)-(int64_t)mem;
-    logln("[RAPZ] mmap RWX gagal errno=%d, coba RW...", err);
-    mem = remote_syscall(pid, original, gadget, __NR_mmap,
-                         0, 0x1000, 3, MAP_PRIVATE_ANON,
-                         (uint64_t)-1, 0);
-    if (is_syscall_error(mem) || mem < 0x10000) {
-        logln("[RAPZ] mmap RW gagal result=%llx", (unsigned long long)mem);
-        return 0;
-    }
-    logln("[RAPZ] mmap RW berhasil: %llx", (unsigned long long)mem);
-    return mem;
-}
-
-static uintptr_t remote_call(pid_t pid, const struct rapz_regs *original, uintptr_t fn,
-                             uintptr_t a0, uintptr_t a1, uintptr_t a2,
-                             uintptr_t a3, uintptr_t a4, uintptr_t a5,
-                             uintptr_t trap) {
-    struct rapz_regs r = *original;
-    r.x[0] = a0; r.x[1] = a1; r.x[2] = a2;
-    r.x[3] = a3; r.x[4] = a4; r.x[5] = a5;
-    r.x[8] = 0;
-    r.x[30] = trap;
-    r.pc = fn;
-
-    if (set_regs(pid, &r) != 0) {
-        logln("[RAPZ] set regs call fn=%llx gagal", (unsigned long long)fn);
-        return 0;
-    }
-
-    if (ptrace(PTRACE_CONT, pid, 0, 0) != 0) {
-        logln("[RAPZ] CONT call fn=%llx gagal: %s",
-              (unsigned long long)fn, strerror(errno));
-        return 0;
-    }
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        logln("[RAPZ] waitpid call gagal: %s", strerror(errno));
-        return 0;
-    }
-    log_status("remote-call", status);
-
-    if (get_regs(pid, &r) != 0) {
-        logln("[RAPZ] get regs call gagal");
-        return 0;
-    }
-    return r.x[0];
-}
-
-static int ptrace_attach_verbose(pid_t pid, int *status) {
-    if (ptrace(PTRACE_ATTACH, pid, 0, 0) == 0) {
-        logln("[RAPZ] PTRACE_ATTACH berhasil");
-    } else {
-        logln("[RAPZ] PTRACE_ATTACH gagal: %s", strerror(errno));
-        logln("[RAPZ] coba PTRACE_SEIZE...");
-        if (ptrace(PTRACE_SEIZE_VAL, pid, 0, 0) != 0) {
-            logln("[RAPZ] PTRACE_SEIZE gagal: %s", strerror(errno));
-            return -1;
-        }
-        logln("[RAPZ] PTRACE_SEIZE berhasil, kirim INTERRUPT");
-        if (ptrace(PTRACE_INTERRUPT_VAL, pid, 0, 0) != 0) {
-            logln("[RAPZ] PTRACE_INTERRUPT gagal: %s", strerror(errno));
-            return -1;
-        }
-    }
-
-    if (waitpid(pid, status, 0) < 0) {
-        logln("[RAPZ] waitpid attach gagal: %s", strerror(errno));
-        return -1;
-    }
-    log_status("attach", *status);
-    return 0;
-}
-
 int main(int argc, char **argv) {
-    const char *lib = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
+    const char *so = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
     const char *pkg = "com.dts.freefireadv";
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
 
-    logln("[RAPZ] build=rapz-v11 === start ===");
+    logln("[RAPZ] build=rapz-v12 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
-          (int)getuid(), (int)getpid(), lib, pkg);
+          (int)getuid(), (int)getpid(), so, pkg);
 
     struct stat st;
-    if (stat(lib, &st) != 0) {
-        logln("[RAPZ] payload tidak ada: %s (%s)", lib, strerror(errno));
-        return 10;
+    if (stat(so, &st) != 0) {
+        logln("[RAPZ] payload tidak ada: %s (%s)", so, strerror(errno));
+        return 1;
     }
     logln("[RAPZ] payload size=%lld mode=%o",
           (long long)st.st_size, (unsigned)st.st_mode & 0777);
@@ -825,6 +303,7 @@ int main(int argc, char **argv) {
         logln("[RAPZ] game belum jalan / cmdline tidak cocok");
         return 1;
     }
+    g_pid = pid;
 
     for (int i = 0; i < 60; i++) {
         if (has_mapping(pid, "libil2cpp.so")) break;
@@ -836,135 +315,94 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    int status = 0;
-    if (ptrace_attach_verbose(pid, &status) != 0) {
-        logln("[RAPZ] attach gagal, kemungkinan anti-debug / SELinux / Yama");
-        return 3;
-    }
+    char libc_path[512] = {0};
+    uintptr_t libc_base = module_base(pid, "libc.so", libc_path, sizeof libc_path);
+    if (!libc_base) return 3;
+    if (!libc_path[0]) snprintf(libc_path, sizeof libc_path, "/system/lib64/libc.so");
 
-    struct rapz_regs original;
-    if (get_regs(pid, &original) != 0) {
-        logln("[RAPZ] get regs awal gagal");
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+    char libdl_path[512] = {0};
+    uintptr_t libdl_base = module_base(pid, "libdl.so", libdl_path, sizeof libdl_path);
+    if (!libdl_base) {
+        logln("[RAPZ] libdl base tidak ada, attach dulu untuk cek map...");
+        if (ptrace(PTRACE_ATTACH, g_pid, 0, 0) < 0) {
+            logln("[RAPZ] attach gagal: %s", strerror(errno));
+            return 3;
+        }
+        { int st2; waitpid(g_pid, &st2, __WALL); }
+        libdl_base = module_base(pid, "libdl.so", libdl_path, sizeof libdl_path);
+        if (!libdl_base) {
+            ptrace(PTRACE_DETACH, g_pid, 0, 0);
+            return 3;
+        }
+        ptrace(PTRACE_DETACH, g_pid, 0, 0);
+    }
+    if (!libdl_path[0]) snprintf(libdl_path, sizeof libdl_path, "/system/lib64/libdl.so");
+
+    uintptr_t off_mmap = symbol_offset(libc_path, "mmap");
+    uintptr_t off_dlopen = symbol_offset(libdl_path, "dlopen");
+    if (!off_mmap || !off_dlopen) {
+        logln("[RAPZ] symbol resolve gagal mmap=%llx dlopen=%llx libc=%s libdl=%s",
+              (unsigned long long)off_mmap, (unsigned long long)off_dlopen,
+              libc_path, libdl_path);
         return 4;
     }
-    logln("[RAPZ] regs pc=%llx sp=%llx",
-          (unsigned long long)original.pc, (unsigned long long)original.sp);
 
-    char libc_path[512] = {0};
-    uintptr_t libc_remote = libc_base(pid, "remote", libc_path, sizeof(libc_path));
-    if (!libc_remote || !libc_path[0]) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+    uint64_t mmap_addr = libc_base + off_mmap;
+    uint64_t dlopen_addr = libdl_base + off_dlopen;
+    logln("[RAPZ] mmap=%llx dlopen=%llx libdlbase=%llx",
+          (unsigned long long)mmap_addr, (unsigned long long)dlopen_addr,
+          (unsigned long long)libdl_base);
+
+    if (ptrace(PTRACE_ATTACH, g_pid, 0, 0) < 0) {
+        logln("[RAPZ] attach gagal: %s", strerror(errno));
         return 5;
     }
+    { int st2; waitpid(g_pid, &st2, __WALL); }
+    logln("[RAPZ] attached");
 
-    uintptr_t off_mmap = elf_symbol_offset(libc_path, "mmap", NULL);
-    uintptr_t off_dlopen = 0;
-    uintptr_t off_dlerror = 0;
-    uintptr_t dl_base = 0;
-
-    char linker_path[512] = {0};
-    uintptr_t linker_remote = module_base(pid, "linker", "linker64",
-                                          linker_path, sizeof(linker_path));
-    if (linker_remote && linker_path[0]) {
-        off_dlopen = elf_symbol_offset(linker_path, "dlopen", "__dlopen");
-        off_dlerror = elf_symbol_offset(linker_path, "dlerror", "__dlerror");
-        if (off_dlopen) dl_base = linker_remote;
-    }
-    if (!off_dlopen && libc_path[0]) {
-        off_dlopen = elf_symbol_offset(libc_path, "dlopen", "__dlopen");
-        off_dlerror = elf_symbol_offset(libc_path, "dlerror", "__dlerror");
-        if (off_dlopen) dl_base = libc_remote;
-    }
-    if (!off_mmap || !off_dlopen) {
-        logln("[RAPZ] simbol ELF tidak lengkap");
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+    struct a64_regs orig;
+    if (ptrace_getregs(&orig) < 0) {
+        logln("[RAPZ] GETREGSET awal gagal: %s", strerror(errno));
+        detach_run();
         return 6;
     }
+    logln("[RAPZ] regs pc=%llx sp=%llx",
+          (unsigned long long)orig.pc, (unsigned long long)orig.sp);
 
-    uintptr_t gadget = find_svc_gadget(pid, libc_path);
-    if (!gadget) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+    uint64_t mem = call_func(mmap_addr, 0, 0x2000, 3, 0x22, (uint64_t)-1, 0, &orig);
+    if ((int64_t)mem <= 0) {
+        logln("[RAPZ] mmap target gagal: %llx", (unsigned long long)mem);
+        ptrace_setregs(&orig);
+        detach_run();
         return 7;
     }
+    logln("[RAPZ] target mmap=%llx", (unsigned long long)mem);
 
-    uintptr_t mem = remote_mmap(pid, &original, gadget);
-    logln("[RAPZ] remote mmap result=%llx", (unsigned long long)mem);
-    if (!mem || mem < 0x10000) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
+    char path[512];
+    snprintf(path, sizeof path, "%s", so);
+    size_t plen = strlen(path) + 1;
+    struct iovec local = { (void *)path, plen };
+    struct iovec remote = { (void *)mem, plen };
+    if (syscall(__NR_process_vm_writev, g_pid, &local, 1, &remote, 1, 0) != (ssize_t)plen) {
+        logln("[RAPZ] process_vm_writev gagal: %s", strerror(errno));
+        ptrace_setregs(&orig);
+        detach_run();
         return 8;
     }
-
-    size_t path_len = strlen(lib) + 1;
-    if (path_len > STUB_OFF - 16) {
-        logln("[RAPZ] path terlalu panjang: %zu", path_len);
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        return 9;
-    }
-
-    if (write_mem(pid, mem, lib, path_len) != 0) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        return 10;
-    }
-
     char verify[512] = {0};
-    if (read_mem(pid, mem, verify, path_len) == 0) {
+    struct iovec rlocal = { verify, sizeof(verify) - 1 };
+    struct iovec rremote = { (void *)mem, sizeof(verify) - 1 };
+    if (syscall(__NR_process_vm_readv, g_pid, &rlocal, 1, &rremote, 1, 0) > 0) {
         logln("[RAPZ] path terverifikasi: %s", verify);
     }
 
-    unsigned char brk_insn[4] = { 0x00, 0x00, 0x20, 0xd4 };
-    if (write_mem(pid, mem + STUB_OFF, brk_insn, sizeof(brk_insn)) != 0) {
-        ptrace(PTRACE_DETACH, pid, 0, 0);
-        return 11;
-    }
-    uintptr_t trap = mem + STUB_OFF;
-    logln("[RAPZ] trap stub=%llx bytes=00 00 20 d4", (unsigned long long)trap);
-
-    uintptr_t mpret = remote_syscall(pid, &original, gadget, __NR_mprotect,
-                                     mem, 0x1000, PROT_RX, 0, 0, 0);
-    if (is_syscall_error(mpret)) {
-        logln("[RAPZ] mprotect RX gagal errno=%d (abaikan kalau RWX)",
-              (int)-(int64_t)mpret);
-    } else {
-        logln("[RAPZ] mprotect RX OK");
-    }
-
-    unsigned long flags = RTLD_NOW_VAL | RTLD_GLOBAL_VAL;
-    logln("[RAPZ] dlopen flags=%lx (NOW|GLOBAL bionic)", flags);
-
-    uintptr_t dlopen_addr = dl_base + off_dlopen;
-    logln("[RAPZ] dlopen addr=%llx base=%llx off=%llx",
-          (unsigned long long)dlopen_addr, (unsigned long long)dl_base,
-          (unsigned long long)off_dlopen);
-    uintptr_t handle = remote_call(pid, &original, dlopen_addr,
-                                   mem, flags, 0, 0, 0, 0, trap);
+    uint64_t handle = call_func(dlopen_addr, mem, 2 /*RTLD_NOW*/, 0, 0, 0, 0, &orig);
     logln("[RAPZ] dlopen handle=%llx", (unsigned long long)handle);
 
-    if (!handle && off_dlerror) {
-        uintptr_t err_ptr = remote_call(pid, &original, dl_base + off_dlerror,
-                                        0, 0, 0, 0, 0, 0, trap);
-        char errbuf[512] = {0};
-        if (err_ptr && read_mem(pid, err_ptr, errbuf, sizeof(errbuf) - 1) == 0) {
-            logln("[RAPZ] dlerror=%s", errbuf);
-        } else {
-            logln("[RAPZ] dlerror ptr=%llx (gagal baca)", (unsigned long long)err_ptr);
-        }
-    }
+    ptrace_setregs(&orig);
+    detach_run();
 
-    if (set_regs(pid, &original) != 0) {
-        logln("[RAPZ] restore regs gagal");
-    } else {
-        logln("[RAPZ] restore regs OK");
-    }
-
-    if (ptrace(PTRACE_DETACH, pid, 0, 0) != 0) {
-        logln("[RAPZ] detach gagal: %s", strerror(errno));
-        return 12;
-    }
-    logln("[RAPZ] detach OK");
-
-    logln("[RAPZ] pid=%d libc=%llx dlbase=%llx handle=%llx result=%s",
-          pid, (unsigned long long)libc_remote, (unsigned long long)dl_base,
+    logln("[RAPZ] pid=%d handle=%llx result=%s", pid,
           (unsigned long long)handle, handle ? "SUCCESS" : "FAILED");
-    return handle ? 0 : 13;
+    return handle ? 0 : 9;
 }

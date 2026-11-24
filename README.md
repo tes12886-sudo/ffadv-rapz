@@ -43,7 +43,7 @@ The script writes `libsheyan.so` and `rapzinj` into `/data/local/tmp/rap/`, star
 
 The script checks the latest GitHub Release tag on every run and downloads `ffadv.sh` when a newer build exists.
 
-- Check: `https://api.github.com/repos/tes12886-sudo/ffadv-rapz/releases/latest` (`tag_name`, e.g. `v11` → `rapz-v11`)
+- Check: `https://api.github.com/repos/tes12886-sudo/ffadv-rapz/releases/latest` (`tag_name`, e.g. `v12` → `rapz-v12`)
 - Fallback check: `https://raw.githubusercontent.com/tes12886-sudo/ffadv-rapz/main/VERSION`
 - Download: `https://github.com/tes12886-sudo/ffadv-rapz/releases/latest/download/ffadv.sh`
 - Fallback download: raw `main/ffadv.sh`
@@ -57,7 +57,7 @@ Every run writes a detailed log to:
 /data/local/tmp/rap/inject.log
 ```
 
-If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, `PTRACE_GETREGSET` fallback, remote libc/linker64 paths and bases, ELF symbol offsets read from the on-device `libc.so` and `linker64` (section-header, dynamic-table and GNU-hash lookup, with `__dlopen`/`__dlerror` aliases), discovered `svc #0` syscall gadget, `PTRACE_SYSCALL` entry/exit with AArch64 `x0` results, `mprotect`, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status. Android 16 builds where `dlopen`/`dlerror` are stripped from both `libc.so` and `linker64` are supported via hash lookup.
+If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, remote `libc.so`/`libdl.so` paths and bases, ELF symbol offsets read from the on-disk libraries, attach status, register hijack calls with return-to-zero SIGSEGV trap, forwarded unrelated signals, `mmap` RW, path verification, `dlopen` result, register restore and detach status. The injector follows the same proven pattern as `rapzz-ffth`: `dlopen` is resolved from `libdl.so`, which works on Android 15/16 devices where `libc.so` and `linker64` no longer export it.
 
 Injector exit codes:
 
