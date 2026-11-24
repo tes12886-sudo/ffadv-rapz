@@ -56,7 +56,7 @@ Every run writes a detailed log to:
 /data/local/tmp/rap/inject.log
 ```
 
-If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, `PTRACE_GETREGSET` fallback, remote libc base, symbol offsets, `PTRACE_SYSCALL` entry/exit with register-based mmap result, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status. Some kernels reject `PTRACE_GET_SYSCALL_INFO`, so the injector reads syscall results from AArch64 `x0` registers instead.
+If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, `PTRACE_GETREGSET` fallback, remote libc path/base, ELF symbol offsets read from the on-device `libc.so`, discovered `svc #0` syscall gadget, `PTRACE_SYSCALL` entry/exit with AArch64 `x0` results, `mprotect`, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status. Kernels that reject `PTRACE_GETREGS`, `PTRACE_GET_SYSCALL_INFO`, and libc-wrapper hijacking are supported via direct raw syscalls.
 
 Injector exit codes:
 

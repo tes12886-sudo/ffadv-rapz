@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-VERSION = "rapz-v7"
+VERSION = "rapz-v8"
 
 ROOT = Path(r"C:\Users\runneradmin\Downloads\projecr")
 REPO = ROOT / "ffadv-rapz"
@@ -89,7 +89,7 @@ if [ "$0" != "$CANON" ]; then
   if cp "$0" "$CANON" 2>/dev/null; then
     chmod 0755 "$CANON" 2>/dev/null
     say "script dinormalisasi: $0 -> $CANON"
-    exec sh "$CANON" --updated "$@"
+    exec sh "$CANON" "$@"
   fi
 fi
 
