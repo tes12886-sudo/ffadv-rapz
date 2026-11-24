@@ -39,6 +39,31 @@ sh /data/local/tmp/rap/ffadv.sh
 
 The script writes `libsheyan.so` and `rapzinj` into `/data/local/tmp/rap/`, starts the game if needed, waits for `libil2cpp.so`, then injects.
 
+Every run writes a detailed log to:
+
+```sh
+/data/local/tmp/rap/inject.log
+```
+
+If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, remote libc base, symbol offsets, mmap result, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status.
+
+Injector exit codes:
+
+| Code | Meaning |
+|---|---|
+| 1 | Game process not found |
+| 2 | `libil2cpp.so` not mapped within 60 seconds |
+| 3 | `PTRACE_ATTACH` and `PTRACE_SEIZE` both failed |
+| 4 | Initial `PTRACE_GETREGS` failed |
+| 5 | Local or remote libc base not found |
+| 6 | `mmap` / `dlopen` / `dlerror` symbol offset missing |
+| 7 | Remote `mmap` returned an invalid address |
+| 8 | Payload path too long |
+| 9 | Writing path into remote memory failed |
+| 10 | Writing trap stub failed |
+| 11 | Remote `dlopen` returned NULL |
+| 12 | `PTRACE_DETACH` failed |
+
 Remove extracted files:
 
 ```sh
@@ -72,7 +97,7 @@ ndk-build NDK_PROJECT_PATH=<repo>/../ffadv-src/ffadv \
   NDK_APPLICATION_MK=<repo>/../ffadv-src/ffadv/src/main/jni/Application.mk
 
 # injector
-clang --target=aarch64-linux-android21 -Os -fPIE -pie -fno-stack-protector \
+clang --target=aarch64-linux-android21 -O2 -fPIE -pie -Wall -Wextra \
   -o build/rapzinj src/rapz_injector.c -ldl -llog
 
 # repackage script
