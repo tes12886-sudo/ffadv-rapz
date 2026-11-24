@@ -21,8 +21,11 @@
 #define PT_POKEDATA 5
 #define PT_GETREGS 12
 #define PT_SETREGS 13
+#define PTRACE_GETREGSET_VAL 0x4204
+#define PTRACE_SETREGSET_VAL 0x4205
 #define PTRACE_SEIZE_VAL 0x4206
 #define PTRACE_INTERRUPT_VAL 0x4207
+#define NT_PRSTATUS 1
 
 #define RTLD_NOW_VAL   0x00000002UL
 #define RTLD_GLOBAL_VAL 0x00000100UL
@@ -59,6 +62,39 @@ static const char *sig_name(int sig) {
         case SIGILL: return "SIGILL";
         default: return "SIG?";
     }
+}
+
+static int get_regs(pid_t pid, struct rapz_regs *r) {
+    memset(r, 0, sizeof(*r));
+    if (ptrace(PT_GETREGS, pid, 0, r) == 0) {
+        logln("[RAPZ] GETREGS OK");
+        return 0;
+    }
+    logln("[RAPZ] GETREGS gagal: %s, coba GETREGSET...", strerror(errno));
+
+    struct iovec io = { r, sizeof(*r) };
+    if (ptrace(PTRACE_GETREGSET_VAL, pid, (void *)NT_PRSTATUS, &io) == 0) {
+        logln("[RAPZ] GETREGSET OK iov_len=%zu", (size_t)io.iov_len);
+        return 0;
+    }
+    logln("[RAPZ] GETREGSET gagal: %s", strerror(errno));
+    return -1;
+}
+
+static int set_regs(pid_t pid, const struct rapz_regs *r) {
+    if (ptrace(PT_SETREGS, pid, 0, (void *)r) == 0) {
+        logln("[RAPZ] SETREGS OK");
+        return 0;
+    }
+    logln("[RAPZ] SETREGS gagal: %s, coba SETREGSET...", strerror(errno));
+
+    struct iovec io = { (void *)r, sizeof(*r) };
+    if (ptrace(PTRACE_SETREGSET_VAL, pid, (void *)NT_PRSTATUS, &io) == 0) {
+        logln("[RAPZ] SETREGSET OK iov_len=%zu", (size_t)io.iov_len);
+        return 0;
+    }
+    logln("[RAPZ] SETREGSET gagal: %s", strerror(errno));
+    return -1;
 }
 
 static void log_status(const char *tag, int status) {
@@ -254,8 +290,8 @@ static uintptr_t remote_mmap(pid_t pid, const struct rapz_regs *original, uintpt
     r.x[5] = 0;
     r.x[8] = 0;
 
-    if (ptrace(PT_SETREGS, pid, 0, &r) != 0) {
-        logln("[RAPZ] SETREGS mmap gagal: %s", strerror(errno));
+    if (set_regs(pid, &r) != 0) {
+        logln("[RAPZ] set regs mmap gagal");
         return 0;
     }
     logln("[RAPZ] remote mmap dipanggil fn=%llx", (unsigned long long)fn);
@@ -283,9 +319,8 @@ static uintptr_t remote_mmap(pid_t pid, const struct rapz_regs *original, uintpt
     }
     log_status("mmap-exit", status);
 
-    memset(&r, 0, sizeof(r));
-    if (ptrace(PT_GETREGS, pid, 0, &r) != 0) {
-        logln("[RAPZ] GETREGS mmap gagal: %s", strerror(errno));
+    if (get_regs(pid, &r) != 0) {
+        logln("[RAPZ] get regs mmap gagal");
         return 0;
     }
     return r.x[0];
@@ -302,9 +337,8 @@ static uintptr_t remote_call(pid_t pid, const struct rapz_regs *original, uintpt
     r.x[30] = trap;
     r.pc = fn;
 
-    if (ptrace(PT_SETREGS, pid, 0, &r) != 0) {
-        logln("[RAPZ] SETREGS call fn=%llx gagal: %s",
-              (unsigned long long)fn, strerror(errno));
+    if (set_regs(pid, &r) != 0) {
+        logln("[RAPZ] set regs call fn=%llx gagal", (unsigned long long)fn);
         return 0;
     }
 
@@ -321,9 +355,8 @@ static uintptr_t remote_call(pid_t pid, const struct rapz_regs *original, uintpt
     }
     log_status("remote-call", status);
 
-    memset(&r, 0, sizeof(r));
-    if (ptrace(PT_GETREGS, pid, 0, &r) != 0) {
-        logln("[RAPZ] GETREGS call gagal: %s", strerror(errno));
+    if (get_regs(pid, &r) != 0) {
+        logln("[RAPZ] get regs call gagal");
         return 0;
     }
     return r.x[0];
@@ -392,9 +425,8 @@ int main(int argc, char **argv) {
     }
 
     struct rapz_regs original;
-    memset(&original, 0, sizeof(original));
-    if (ptrace(PT_GETREGS, pid, 0, &original) != 0) {
-        logln("[RAPZ] GETREGS awal gagal: %s", strerror(errno));
+    if (get_regs(pid, &original) != 0) {
+        logln("[RAPZ] get regs awal gagal");
         ptrace(PTRACE_DETACH, pid, 0, 0);
         return 4;
     }
@@ -466,8 +498,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (ptrace(PT_SETREGS, pid, 0, &original) != 0) {
-        logln("[RAPZ] restore regs gagal: %s", strerror(errno));
+    if (set_regs(pid, &original) != 0) {
+        logln("[RAPZ] restore regs gagal");
     } else {
         logln("[RAPZ] restore regs OK");
     }

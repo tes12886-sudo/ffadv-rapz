@@ -54,7 +54,7 @@ Injector exit codes:
 | 1 | Game process not found |
 | 2 | `libil2cpp.so` not mapped within 60 seconds |
 | 3 | `PTRACE_ATTACH` and `PTRACE_SEIZE` both failed |
-| 4 | Initial `PTRACE_GETREGS` failed |
+| 4 | Initial `PTRACE_GETREGS` and `PTRACE_GETREGSET` both failed |
 | 5 | Local or remote libc base not found |
 | 6 | `mmap` / `dlopen` / `dlerror` symbol offset missing |
 | 7 | Remote `mmap` returned an invalid address |
