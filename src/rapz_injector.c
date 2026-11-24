@@ -357,16 +357,146 @@ static uint64_t rd64(const unsigned char *p) {
     return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32);
 }
 
-static uintptr_t elf_symbol_offset(const char *path, const char *name) {
+static uint32_t gnu_hash(const unsigned char *name) {
+    uint32_t h = 5381;
+    while (*name) h = h * 33 + *name++;
+    return h;
+}
+
+static uintptr_t scan_elf_symbols(unsigned char *buf, uint64_t fsz,
+                                  uint64_t symoff, uint64_t symsz,
+                                  uint64_t stroff, uint64_t strsz,
+                                  uint64_t entsize,
+                                  const char *const *names, unsigned nnames,
+                                  const char *path) {
+    if (!entsize) entsize = 24;
+    if (symoff + symsz > fsz || stroff + strsz > fsz) return 0;
+    uint64_t count = symsz / entsize;
+
+    for (uint64_t j = 0; j < count; j++) {
+        const unsigned char *sym = buf + symoff + j * entsize;
+        uint32_t nameoff = rd32(sym);
+        uint8_t info = sym[4];
+        uint64_t value = rd64(sym + 8);
+        if (!value) continue;
+        if (nameoff >= strsz) continue;
+        if ((info & 0x0f) != 2) continue;
+        const char *symname = (const char *)(buf + stroff + nameoff);
+        for (unsigned k = 0; k < nnames; k++) {
+            if (strcmp(symname, names[k]) == 0) {
+                logln("[RAPZ] ELF sym %-9s off=%llx path=%s",
+                      names[k], (unsigned long long)value, path);
+                return (uintptr_t)value;
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t elf_dynamic_offset(unsigned char *buf, uint64_t fsz,
+                                    uint32_t tag, uint64_t *out) {
+    uint64_t phoff = rd64(buf + 0x20);
+    uint16_t phentsize = rd16(buf + 0x36);
+    uint16_t phnum = rd16(buf + 0x38);
+    if (!phentsize) phentsize = 56;
+
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t p = phoff + (uint64_t)i * phentsize;
+        if (p + 56 > fsz) continue;
+        const unsigned char *ph = buf + p;
+        if (rd32(ph) != 2) continue;
+        uint64_t off = rd64(ph + 8);
+        uint64_t filesz = rd64(ph + 32);
+        if (off + filesz > fsz) continue;
+        for (uint64_t d = off; d + 16 <= off + filesz; d += 16) {
+            uint64_t dtag = rd64(buf + d);
+            if (dtag == 0) return 0;
+            if (dtag == tag) { *out = rd64(buf + d + 8); return 1; }
+        }
+    }
+    return 0;
+}
+
+static uint64_t vaddr_to_off(unsigned char *buf, uint64_t fsz, uint64_t va) {
+    uint64_t phoff = rd64(buf + 0x20);
+    uint16_t phentsize = rd16(buf + 0x36);
+    uint16_t phnum = rd16(buf + 0x38);
+    if (!phentsize) phentsize = 56;
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t p = phoff + (uint64_t)i * phentsize;
+        if (p + 56 > fsz) continue;
+        const unsigned char *ph = buf + p;
+        if (rd32(ph) != 1) continue;
+        uint64_t vaddr = rd64(ph + 16);
+        uint64_t filesz = rd64(ph + 32);
+        uint64_t off = rd64(ph + 8);
+        if (va >= vaddr && va < vaddr + filesz) return off + (va - vaddr);
+    }
+    return 0;
+}
+
+static uintptr_t elf_gnu_hash_lookup(unsigned char *buf, uint64_t fsz,
+                                     uint64_t hash_va, uint64_t str_va,
+                                     const char *const *names, unsigned nnames,
+                                     const char *path) {
+    uint64_t hoff = vaddr_to_off(buf, fsz, hash_va);
+    uint64_t soff = vaddr_to_off(buf, fsz, str_va);
+    if (!hoff || !soff || hoff + 16 > fsz) return 0;
+
+    uint32_t nbuckets = rd32(buf + hoff);
+    uint32_t symoffset = rd32(buf + hoff + 4);
+    uint32_t bloom_size = rd32(buf + hoff + 8);
+
+    uint64_t buckets_off = hoff + 16 + (uint64_t)bloom_size * 8;
+    uint64_t chain_off = buckets_off + (uint64_t)nbuckets * 4;
+    if (buckets_off + nbuckets * 4 > fsz) return 0;
+
+    for (unsigned k = 0; k < nnames; k++) {
+        uint32_t h = gnu_hash((const unsigned char *)names[k]);
+        uint32_t bucket = rd32(buf + buckets_off + (h % nbuckets) * 4);
+        if (bucket < symoffset) continue;
+        uint64_t idx = bucket;
+        while (idx < symoffset + 1000000ULL) {
+            uint64_t coff = chain_off + (idx - symoffset) * 4;
+            if (coff + 4 > fsz) break;
+            uint32_t ch = rd32(buf + coff);
+            if ((ch | 1U) == (h | 1U)) {
+                uint64_t symva = 0;
+                uint64_t symtab = 0;
+                if (!elf_dynamic_offset(buf, fsz, 6, &symtab)) break;
+                symva = symtab + idx * 24;
+                uint64_t symoff = vaddr_to_off(buf, fsz, symva);
+                if (!symoff || symoff + 24 > fsz) break;
+                const unsigned char *sym = buf + symoff;
+                uint32_t nameoff = rd32(sym);
+                uint64_t value = rd64(sym + 8);
+                if (value && nameoff) {
+                    const char *symname = (const char *)(buf + soff + nameoff);
+                    if (strcmp(symname, names[k]) == 0) {
+                        logln("[RAPZ] GNU-hash sym %-9s off=%llx path=%s",
+                              names[k], (unsigned long long)value, path);
+                        return (uintptr_t)value;
+                    }
+                }
+            }
+            if (ch & 1U) break;
+            idx++;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t elf_symbol_offset(const char *path, const char *name, const char *alias) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         logln("[RAPZ] ELF buka gagal: %s (%s)", path, strerror(errno));
         return 0;
     }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
-    long fsz = ftell(f);
+    long fsz_l = ftell(f);
     rewind(f);
-    if (fsz < 64) { fclose(f); return 0; }
+    if (fsz_l < 64) { fclose(f); return 0; }
+    uint64_t fsz = (uint64_t)fsz_l;
 
     unsigned char *buf = (unsigned char *)malloc((size_t)fsz);
     if (!buf) { fclose(f); return 0; }
@@ -381,13 +511,17 @@ static uintptr_t elf_symbol_offset(const char *path, const char *name) {
         return 0;
     }
 
+    const char *names[2] = { name, alias };
+    unsigned nnames = alias ? 2 : 1;
+
     uint64_t shoff = rd64(buf + 0x28);
     uint16_t shentsize = rd16(buf + 0x3A);
     uint16_t shnum = rd16(buf + 0x3C);
     if (!shentsize) shentsize = 64;
 
+    uintptr_t found = 0;
     const uint32_t wanted[] = { 11, 2 };
-    for (unsigned w = 0; w < 2; w++) {
+    for (unsigned w = 0; w < 2 && !found; w++) {
         for (uint16_t i = 0; i < shnum; i++) {
             uint64_t shp = shoff + (uint64_t)i * shentsize;
             if (shp + 64 > (uint64_t)fsz) continue;
@@ -401,34 +535,63 @@ static uintptr_t elf_symbol_offset(const char *path, const char *name) {
             const unsigned char *strsh = buf + shoff + (uint64_t)stridx * shentsize;
             uint64_t stroff = rd64(strsh + 0x18);
             uint64_t strsz = rd64(strsh + 0x20);
-            if (stroff + strsz > (uint64_t)fsz) continue;
-
             uint64_t symoff = rd64(sh + 0x18);
             uint64_t symsz = rd64(sh + 0x20);
             uint64_t entsize = rd64(sh + 0x38);
-            if (!entsize) entsize = 24;
-            if (symoff + symsz > (uint64_t)fsz) continue;
 
-            uint64_t count = symsz / entsize;
-            for (uint64_t j = 0; j < count; j++) {
-                const unsigned char *sym = buf + symoff + j * entsize;
-                uint32_t nameoff = rd32(sym);
-                if (nameoff >= strsz) continue;
-                const char *symname = (const char *)(buf + stroff + nameoff);
-                if (strcmp(symname, name) == 0) {
-                    uint64_t off = rd64(sym + 8);
-                    logln("[RAPZ] ELF sym %-8s off=%llx path=%s",
-                          name, (unsigned long long)off, path);
-                    free(buf);
-                    return (uintptr_t)off;
-                }
-            }
+            found = scan_elf_symbols(buf, fsz, symoff, symsz, stroff, strsz,
+                                     entsize, names, nnames, path);
+            if (found) break;
         }
     }
 
-    logln("[RAPZ] ELF sym %s TIDAK ditemukan di %s", name, path);
+    if (!found) {
+        uint64_t strtab = 0, symtab = 0, syment = 0, hashtab = 0, gnuhash = 0;
+        elf_dynamic_offset(buf, fsz, 5, &strtab);
+        elf_dynamic_offset(buf, fsz, 6, &symtab);
+        elf_dynamic_offset(buf, fsz, 11, &syment);
+        elf_dynamic_offset(buf, fsz, 4, &hashtab);
+        elf_dynamic_offset(buf, fsz, 0x6ffffef5, &gnuhash);
+
+        if (symtab && strtab) {
+            uint64_t str_off = vaddr_to_off(buf, fsz, strtab);
+            uint64_t sym_off = vaddr_to_off(buf, fsz, symtab);
+            uint64_t nsyms = 0;
+            if (gnuhash) {
+                uint64_t gh = vaddr_to_off(buf, fsz, gnuhash);
+                if (gh && gh + 8 <= fsz) {
+                    uint32_t nb = rd32(buf + gh);
+                    uint32_t symoffset = rd32(buf + gh + 4);
+                    uint32_t mx = symoffset;
+                    uint64_t coff = gh + 16 + 8 + (uint64_t)nb * 4;
+                    for (uint32_t i = 0; i < 200000 && coff + 4 <= fsz; i++, coff += 4) {
+                        uint32_t ch = rd32(buf + coff);
+                        if (ch & 1U) { mx = symoffset + i; break; }
+                    }
+                    nsyms = mx + 1;
+                }
+            }
+            if (!nsyms && hashtab) {
+                uint64_t ht = vaddr_to_off(buf, fsz, hashtab);
+                if (ht + 8 <= fsz) nsyms = rd32(buf + ht + 4);
+            }
+            if (!nsyms) nsyms = 100000;
+            if (str_off && sym_off) {
+                found = scan_elf_symbols(buf, fsz, sym_off, nsyms * (syment ? syment : 24),
+                                         str_off, fsz - str_off, syment ? syment : 24,
+                                         names, nnames, path);
+            }
+        }
+        if (!found && gnuhash && strtab) {
+            found = elf_gnu_hash_lookup(buf, fsz, gnuhash, strtab, names, nnames, path);
+        }
+    }
+
+    if (!found) {
+        logln("[RAPZ] ELF sym %s TIDAK ditemukan di %s", name, path);
+    }
     free(buf);
-    return 0;
+    return found;
 }
 
 static uintptr_t find_svc_gadget(pid_t pid, const char *libc_path) {
@@ -645,7 +808,7 @@ int main(int argc, char **argv) {
     const char *lib = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
     const char *pkg = "com.dts.freefireadv";
 
-    logln("[RAPZ] build=rapz-v10 === start ===");
+    logln("[RAPZ] build=rapz-v11 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), lib, pkg);
 
@@ -695,7 +858,7 @@ int main(int argc, char **argv) {
         return 5;
     }
 
-    uintptr_t off_mmap = elf_symbol_offset(libc_path, "mmap");
+    uintptr_t off_mmap = elf_symbol_offset(libc_path, "mmap", NULL);
     uintptr_t off_dlopen = 0;
     uintptr_t off_dlerror = 0;
     uintptr_t dl_base = 0;
@@ -704,13 +867,13 @@ int main(int argc, char **argv) {
     uintptr_t linker_remote = module_base(pid, "linker", "linker64",
                                           linker_path, sizeof(linker_path));
     if (linker_remote && linker_path[0]) {
-        off_dlopen = elf_symbol_offset(linker_path, "dlopen");
-        off_dlerror = elf_symbol_offset(linker_path, "dlerror");
+        off_dlopen = elf_symbol_offset(linker_path, "dlopen", "__dlopen");
+        off_dlerror = elf_symbol_offset(linker_path, "dlerror", "__dlerror");
         if (off_dlopen) dl_base = linker_remote;
     }
     if (!off_dlopen && libc_path[0]) {
-        off_dlopen = elf_symbol_offset(libc_path, "dlopen");
-        off_dlerror = elf_symbol_offset(libc_path, "dlerror");
+        off_dlopen = elf_symbol_offset(libc_path, "dlopen", "__dlopen");
+        off_dlerror = elf_symbol_offset(libc_path, "dlerror", "__dlerror");
         if (off_dlopen) dl_base = libc_remote;
     }
     if (!off_mmap || !off_dlopen) {
