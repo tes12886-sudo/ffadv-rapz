@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-VERSION = "rapz-v8"
+VERSION = "rapz-v9"
 
 ROOT = Path(r"C:\Users\runneradmin\Downloads\projecr")
 REPO = ROOT / "ffadv-rapz"
@@ -114,11 +114,14 @@ fetch() {{
 
 if [ "$UPDATED" -ne 1 ] && [ "$RAPZ_NO_UPDATE" != "1" ]; then
   say "cek update GitHub Release..."
-  REMOTE_VER=$(fetch "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \\r\\n' | head -1)
   REL_TAG=$(fetch "$API_URL" 2>/dev/null | tr -d '\\r' | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/')
-
+  REMOTE_VER=""
   if [ -n "$REL_TAG" ]; then
-    say "release terbaru: $REL_TAG"
+    REMOTE_VER="rapz-${{REL_TAG#v}}"
+    say "release terbaru: $REL_TAG -> $REMOTE_VER"
+  fi
+  if [ -z "$REMOTE_VER" ]; then
+    REMOTE_VER=$(fetch "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \\r\\n' | head -1)
   fi
 
   if [ -n "$REMOTE_VER" ] && [ "$REMOTE_VER" != "$BUILD" ]; then

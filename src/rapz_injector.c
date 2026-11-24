@@ -590,7 +590,7 @@ int main(int argc, char **argv) {
     const char *lib = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
     const char *pkg = "com.dts.freefireadv";
 
-    logln("[RAPZ] build=rapz-v8 === start ===");
+    logln("[RAPZ] build=rapz-v9 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), lib, pkg);
 
