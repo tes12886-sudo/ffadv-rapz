@@ -45,7 +45,7 @@ Every run writes a detailed log to:
 /data/local/tmp/rap/inject.log
 ```
 
-If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, remote libc base, symbol offsets, mmap result, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status.
+If inject fails, the script prints the full log automatically. It includes PID candidates, `libil2cpp.so` mapping, attach status, `PTRACE_GETREGSET` fallback, remote libc base, symbol offsets, `PTRACE_GET_SYSCALL_INFO` entry/exit for mmap, mmap result, path verification, trap stub, `dlopen` flags, `dlerror`, register restore and detach status.
 
 Injector exit codes:
 
