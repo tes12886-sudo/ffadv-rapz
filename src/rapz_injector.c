@@ -101,31 +101,6 @@ static int set_regs(pid_t pid, const struct rapz_regs *r) {
     return -1;
 }
 
-static int get_syscall_info(pid_t pid, struct ptrace_syscall_info *si) {
-    memset(si, 0, sizeof(*si));
-    if (ptrace(PTRACE_GET_SYSCALL_INFO, pid, (void *)sizeof(*si), si) != 0) {
-        logln("[RAPZ] PTRACE_GET_SYSCALL_INFO gagal: %s", strerror(errno));
-        return -1;
-    }
-
-    if (si->op == PTRACE_SYSCALL_INFO_ENTRY) {
-        logln("[RAPZ] syscall ENTRY nr=%llu args=%llx,%llx,%llx,%llx,%llx,%llx",
-              (unsigned long long)si->entry.nr,
-              (unsigned long long)si->entry.args[0],
-              (unsigned long long)si->entry.args[1],
-              (unsigned long long)si->entry.args[2],
-              (unsigned long long)si->entry.args[3],
-              (unsigned long long)si->entry.args[4],
-              (unsigned long long)si->entry.args[5]);
-    } else if (si->op == PTRACE_SYSCALL_INFO_EXIT) {
-        logln("[RAPZ] syscall EXIT rval=%lld is_error=%u",
-              (long long)si->exit.rval, (unsigned)si->exit.is_error);
-    } else {
-        logln("[RAPZ] syscall op=%u", (unsigned)si->op);
-    }
-    return 0;
-}
-
 static void log_status(const char *tag, int status) {
     if (WIFSTOPPED(status)) {
         logln("[RAPZ][%s] stopped: %s (%d)", tag, sig_name(WSTOPSIG(status)), WSTOPSIG(status));
@@ -317,71 +292,60 @@ static uintptr_t remote_mmap(pid_t pid, const struct rapz_regs *original, uintpt
     r.x[3] = 0x22;
     r.x[4] = (uint64_t)-1;
     r.x[5] = 0;
+    r.x[8] = 0;
+    r.pc = fn;
 
     if (set_regs(pid, &r) != 0) {
         logln("[RAPZ] set regs mmap gagal");
         return 0;
     }
-    logln("[RAPZ] remote mmap dipanggil fn=%llx nr=%d",
-          (unsigned long long)fn, __NR_mmap);
+    logln("[RAPZ] remote mmap dipanggil fn=%llx pc=%llx",
+          (unsigned long long)fn, (unsigned long long)r.pc);
 
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
         logln("[RAPZ] PTRACE_SYSCALL entry gagal: %s", strerror(errno));
         return 0;
     }
 
-    struct ptrace_syscall_info si;
-    int found_entry = 0;
-
-    for (int i = 0; i < 8; i++) {
-        int status = 0;
-        if (waitpid(pid, &status, 0) < 0) {
-            logln("[RAPZ] waitpid syscall gagal: %s", strerror(errno));
-            return 0;
-        }
-        log_status("syscall", status);
-
-        if (get_syscall_info(pid, &si) != 0) return 0;
-
-        if (si.op == PTRACE_SYSCALL_INFO_ENTRY && si.entry.nr == __NR_mmap) {
-            found_entry = 1;
-            break;
-        }
-
-        if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
-            logln("[RAPZ] PTRACE_SYSCALL lanjut gagal: %s", strerror(errno));
-            return 0;
-        }
-    }
-
-    if (!found_entry) {
-        logln("[RAPZ] entry mmap tidak ketemu setelah 8 stop");
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        logln("[RAPZ] waitpid mmap-entry gagal: %s", strerror(errno));
         return 0;
     }
+    log_status("mmap-entry", status);
+
+    if (get_regs(pid, &r) != 0) {
+        logln("[RAPZ] get regs mmap-entry gagal");
+        return 0;
+    }
+    logln("[RAPZ] mmap-entry pc=%llx x8=%llx x0=%llx",
+          (unsigned long long)r.pc, (unsigned long long)r.x[8],
+          (unsigned long long)r.x[0]);
 
     if (ptrace(PTRACE_SYSCALL, pid, 0, 0) != 0) {
         logln("[RAPZ] PTRACE_SYSCALL exit gagal: %s", strerror(errno));
         return 0;
     }
 
-    int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
-        logln("[RAPZ] waitpid exit gagal: %s", strerror(errno));
+        logln("[RAPZ] waitpid mmap-exit gagal: %s", strerror(errno));
         return 0;
     }
     log_status("mmap-exit", status);
 
-    if (get_syscall_info(pid, &si) != 0) return 0;
-    if (si.op != PTRACE_SYSCALL_INFO_EXIT) {
-        logln("[RAPZ] stop bukan syscall EXIT, op=%u", (unsigned)si.op);
-        return 0;
-    }
-    if (si.exit.is_error) {
-        logln("[RAPZ] mmap syscall error: -%d", (int)-si.exit.rval);
+    if (get_regs(pid, &r) != 0) {
+        logln("[RAPZ] get regs mmap-exit gagal");
         return 0;
     }
 
-    return (uintptr_t)si.exit.rval;
+    uintptr_t result = (uintptr_t)r.x[0];
+    logln("[RAPZ] mmap-exit x0=%llx", (unsigned long long)result);
+
+    if ((int64_t)result < 0 && result > (uintptr_t)-4096) {
+        logln("[RAPZ] mmap syscall error: -%d", (int)-(int64_t)result);
+        return 0;
+    }
+    return result;
 }
 
 static uintptr_t remote_call(pid_t pid, const struct rapz_regs *original, uintptr_t fn,
@@ -449,7 +413,7 @@ int main(int argc, char **argv) {
     const char *lib = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
     const char *pkg = "com.dts.freefireadv";
 
-    logln("[RAPZ] build=rapz-v6 === start ===");
+    logln("[RAPZ] build=rapz-v7 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), lib, pkg);
 
