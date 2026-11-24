@@ -238,6 +238,61 @@ static uintptr_t libc_base(pid_t pid, const char *label, char *path_out, size_t 
     return base;
 }
 
+static uintptr_t module_base(pid_t pid, const char *label, const char *needle,
+                             char *path_out, size_t path_cap) {
+    char maps[64];
+    snprintf(maps, sizeof(maps), "/proc/%d/maps", pid);
+    FILE *f = fopen(maps, "r");
+    if (!f) {
+        logln("[RAPZ] buka %s gagal: %s", maps, strerror(errno));
+        return 0;
+    }
+
+    char line[1024];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, needle) && strstr(line, "r--p") && strstr(line, " 00000000 ")) {
+            if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
+                copy_map_path(line, path_out, path_cap);
+                logln("[RAPZ] %s base=%llx path=%s (%s)", label,
+                      (unsigned long long)base, path_out, line);
+                break;
+            }
+        }
+    }
+    if (!base) {
+        rewind(f);
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, needle)) {
+                if (sscanf(line, "%lx-", (unsigned long *)&base) == 1) {
+                    copy_map_path(line, path_out, path_cap);
+                    logln("[RAPZ] %s base fallback=%llx path=%s (%s)", label,
+                          (unsigned long long)base, path_out, line);
+                    break;
+                }
+            }
+        }
+    }
+    fclose(f);
+
+    if (!path_out || !path_out[0]) {
+        const char *candidates[] = {
+            "/system/bin/linker64",
+            "/apex/com.android.runtime/bin/linker64"
+        };
+        for (unsigned i = 0; i < 2; i++) {
+            struct stat s;
+            if (stat(candidates[i], &s) == 0) {
+                snprintf(path_out, path_cap, "%s", candidates[i]);
+                logln("[RAPZ] %s path fallback=%s", label, path_out);
+                break;
+            }
+        }
+    }
+    if (!base) logln("[RAPZ] %s base TIDAK ditemukan", label);
+    return base;
+}
+
 static long peek_word(pid_t pid, uintptr_t addr) {
     errno = 0;
     return ptrace(PT_PEEKDATA, pid, (void *)addr, 0);
@@ -590,7 +645,7 @@ int main(int argc, char **argv) {
     const char *lib = argc > 1 ? argv[1] : "/data/local/tmp/rap/libsheyan.so";
     const char *pkg = "com.dts.freefireadv";
 
-    logln("[RAPZ] build=rapz-v9 === start ===");
+    logln("[RAPZ] build=rapz-v10 === start ===");
     logln("[RAPZ] uid=%d pid_self=%d lib=%s target=%s",
           (int)getuid(), (int)getpid(), lib, pkg);
 
@@ -641,8 +696,23 @@ int main(int argc, char **argv) {
     }
 
     uintptr_t off_mmap = elf_symbol_offset(libc_path, "mmap");
-    uintptr_t off_dlopen = elf_symbol_offset(libc_path, "dlopen");
-    uintptr_t off_dlerror = elf_symbol_offset(libc_path, "dlerror");
+    uintptr_t off_dlopen = 0;
+    uintptr_t off_dlerror = 0;
+    uintptr_t dl_base = 0;
+
+    char linker_path[512] = {0};
+    uintptr_t linker_remote = module_base(pid, "linker", "linker64",
+                                          linker_path, sizeof(linker_path));
+    if (linker_remote && linker_path[0]) {
+        off_dlopen = elf_symbol_offset(linker_path, "dlopen");
+        off_dlerror = elf_symbol_offset(linker_path, "dlerror");
+        if (off_dlopen) dl_base = linker_remote;
+    }
+    if (!off_dlopen && libc_path[0]) {
+        off_dlopen = elf_symbol_offset(libc_path, "dlopen");
+        off_dlerror = elf_symbol_offset(libc_path, "dlerror");
+        if (off_dlopen) dl_base = libc_remote;
+    }
     if (!off_mmap || !off_dlopen) {
         logln("[RAPZ] simbol ELF tidak lengkap");
         ptrace(PTRACE_DETACH, pid, 0, 0);
@@ -699,14 +769,16 @@ int main(int argc, char **argv) {
     unsigned long flags = RTLD_NOW_VAL | RTLD_GLOBAL_VAL;
     logln("[RAPZ] dlopen flags=%lx (NOW|GLOBAL bionic)", flags);
 
-    uintptr_t dlopen_addr = libc_remote + off_dlopen;
-    logln("[RAPZ] dlopen addr=%llx", (unsigned long long)dlopen_addr);
+    uintptr_t dlopen_addr = dl_base + off_dlopen;
+    logln("[RAPZ] dlopen addr=%llx base=%llx off=%llx",
+          (unsigned long long)dlopen_addr, (unsigned long long)dl_base,
+          (unsigned long long)off_dlopen);
     uintptr_t handle = remote_call(pid, &original, dlopen_addr,
                                    mem, flags, 0, 0, 0, 0, trap);
     logln("[RAPZ] dlopen handle=%llx", (unsigned long long)handle);
 
     if (!handle && off_dlerror) {
-        uintptr_t err_ptr = remote_call(pid, &original, libc_remote + off_dlerror,
+        uintptr_t err_ptr = remote_call(pid, &original, dl_base + off_dlerror,
                                         0, 0, 0, 0, 0, 0, trap);
         char errbuf[512] = {0};
         if (err_ptr && read_mem(pid, err_ptr, errbuf, sizeof(errbuf) - 1) == 0) {
@@ -728,8 +800,8 @@ int main(int argc, char **argv) {
     }
     logln("[RAPZ] detach OK");
 
-    logln("[RAPZ] pid=%d libc=%llx handle=%llx result=%s",
-          pid, (unsigned long long)libc_remote, (unsigned long long)handle,
-          handle ? "SUCCESS" : "FAILED");
+    logln("[RAPZ] pid=%d libc=%llx dlbase=%llx handle=%llx result=%s",
+          pid, (unsigned long long)libc_remote, (unsigned long long)dl_base,
+          (unsigned long long)handle, handle ? "SUCCESS" : "FAILED");
     return handle ? 0 : 13;
 }
