@@ -39,6 +39,17 @@ sh /data/local/tmp/rap/ffadv.sh
 
 The script writes `libsheyan.so` and `rapzinj` into `/data/local/tmp/rap/`, starts the game if needed, waits for `libil2cpp.so`, then injects.
 
+## Auto update
+
+The script checks `VERSION` from this repo on every run and downloads `ffadv.sh` from the latest GitHub Release when a newer build exists.
+
+- Check: `https://raw.githubusercontent.com/tes12886-sudo/ffadv-rapz/main/VERSION`
+- Download: `https://github.com/tes12886-sudo/ffadv-rapz/releases/latest/download/ffadv.sh`
+- Fallback download: raw `main/ffadv.sh`
+- Skip check with `sh /data/local/tmp/rap/ffadv.sh --no-update`
+
+It also normalizes any duplicate filename such as `ffadv (1).sh` into `/data/local/tmp/rap/ffadv.sh` before continuing.
+
 Every run writes a detailed log to:
 
 ```sh

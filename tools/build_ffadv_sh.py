@@ -1,7 +1,7 @@
 import base64
 from pathlib import Path
 
-VERSION = "rapz-v5"
+VERSION = "rapz-v6"
 
 ROOT = Path(r"C:\Users\runneradmin\Downloads\projecr")
 REPO = ROOT / "ffadv-rapz"
@@ -25,17 +25,27 @@ script = f'''#!/system/bin/sh
 #  Credit : FULL RAPZ
 #  Build  : {VERSION}
 #  Log    : /data/local/tmp/rap/inject.log
+#  Update : GitHub Release latest (auto)
 #  Tidak butuh Magisk / Zygisk. Cukup root + arm64-v8a.
 #
-#  sh /data/local/tmp/rap/ffadv.sh            -> inject
-#  sh /data/local/tmp/rap/ffadv.sh uninstall  -> hapus file
+#  sh /data/local/tmp/rap/ffadv.sh             -> inject
+#  sh /data/local/tmp/rap/ffadv.sh uninstall   -> hapus file
+#  sh /data/local/tmp/rap/ffadv.sh --no-update -> inject tanpa cek update
 # ============================================================
 
+BUILD="{VERSION}"
 DIR="/data/local/tmp/rap"
+CANON="$DIR/ffadv.sh"
 PKG="com.dts.freefireadv"
 PAYLOAD="$DIR/libsheyan.so"
 INJECTOR="$DIR/rapzinj"
 LOG="$DIR/inject.log"
+NEW="$DIR/ffadv.sh.new"
+
+RAW_BASE="https://raw.githubusercontent.com/tes12886-sudo/ffadv-rapz/main"
+RELEASE_URL="https://github.com/tes12886-sudo/ffadv-rapz/releases/latest/download/ffadv.sh"
+RAW_URL="$RAW_BASE/ffadv.sh"
+API_URL="https://api.github.com/repos/tes12886-sudo/ffadv-rapz/releases/latest"
 
 mkdir -p "$DIR" 2>/dev/null
 : > "$LOG" 2>/dev/null
@@ -60,20 +70,85 @@ fail() {{
   exit 1
 }}
 
+UPDATED=0
+if [ "$1" = "--updated" ]; then UPDATED=1; shift; fi
+if [ "$1" = "--no-update" ]; then shift; RAPZ_NO_UPDATE=1; fi
+
 if [ "$(id -u)" -ne 0 ]; then
   fail "butuh root. jalankan lewat su."
 fi
 
 if [ "$1" = "uninstall" ] || [ "$1" = "remove" ]; then
-  rm -f "$PAYLOAD" "$INJECTOR" "$LOG"
+  rm -f "$CANON" "$PAYLOAD" "$INJECTOR" "$LOG" "$NEW"
   say "file dihapus dari $DIR"
   exit 0
 fi
 
-say "build={VERSION}"
+# Selalu normalisasi ke /data/local/tmp/rap/ffadv.sh
+if [ "$0" != "$CANON" ]; then
+  if cp "$0" "$CANON" 2>/dev/null; then
+    chmod 0755 "$CANON" 2>/dev/null
+    say "script dinormalisasi: $0 -> $CANON"
+    exec sh "$CANON" --updated "$@"
+  fi
+fi
+
+say "build=$BUILD"
 say "uid=$(id -u) arch=$(uname -m) kernel=$(uname -r)"
 say "script=$0"
 say "log=$LOG"
+
+fetch() {{
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time 20 "$1"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O - -T 8 -t 1 "$1"
+  elif command -v toybox >/dev/null 2>&1 && toybox wget >/dev/null 2>&1; then
+    toybox wget -q -O - "$1"
+  elif command -v busybox >/dev/null 2>&1 && busybox wget >/dev/null 2>&1; then
+    busybox wget -q -O - "$1"
+  else
+    return 1
+  fi
+}}
+
+if [ "$UPDATED" -ne 1 ] && [ "$RAPZ_NO_UPDATE" != "1" ]; then
+  say "cek update GitHub Release..."
+  REMOTE_VER=$(fetch "$RAW_BASE/VERSION" 2>/dev/null | tr -d ' \\r\\n' | head -1)
+  REL_TAG=$(fetch "$API_URL" 2>/dev/null | tr -d '\\r' | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/')
+
+  if [ -n "$REL_TAG" ]; then
+    say "release terbaru: $REL_TAG"
+  fi
+
+  if [ -n "$REMOTE_VER" ] && [ "$REMOTE_VER" != "$BUILD" ]; then
+    say "update tersedia: $BUILD -> $REMOTE_VER"
+    rm -f "$NEW"
+
+    OK=0
+    if fetch "$RELEASE_URL" > "$NEW" 2>/dev/null; then OK=1; fi
+    if [ "$OK" -ne 1 ]; then
+      rm -f "$NEW"
+      if fetch "$RAW_URL" > "$NEW" 2>/dev/null; then OK=1; fi
+    fi
+
+    if [ "$OK" = "1" ] && [ -s "$NEW" ] \\
+       && grep -q "#!/system/bin/sh" "$NEW" \\
+       && grep -q "build=$REMOTE_VER" "$NEW"; then
+      chmod 0755 "$NEW" 2>/dev/null
+      mv -f "$NEW" "$CANON"
+      say "update terpasang, restart dengan $BUILD -> $REMOTE_VER"
+      exec sh "$CANON" --updated "$@"
+    else
+      say "update gagal verifikasi, tetap pakai $BUILD"
+      rm -f "$NEW"
+    fi
+  else
+    say "release sudah terbaru: $BUILD"
+  fi
+else
+  say "update dilewati"
+fi
 
 if command -v base64 >/dev/null 2>&1; then
   DEC="base64 -d"
@@ -131,5 +206,6 @@ exit 0
 
 REPO.mkdir(parents=True, exist_ok=True)
 OUT.write_text(script, encoding="utf-8", newline="\n")
+(REPO / "VERSION").write_text(VERSION + "\n", encoding="utf-8", newline="\n")
 print(OUT)
 print(OUT.stat().st_size)
